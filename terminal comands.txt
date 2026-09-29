@@ -1,0 +1,8 @@
+First terminal:
+
+cd "C:\Users\dz company\OneDrive\Desktop\Whatsapp Bot"
+python -m uvicorn main:app --reload --port 8000
+
+second one:
+cd "C:\Users\dz company\OneDrive\Desktop\Whatsapp Bot"
+ngrok http 8000

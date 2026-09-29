@@ -1,0 +1,42 @@
+Ciao! 👋 Ogni giorno molti istruttori perdono tempo a ricordare le lezioni agli studenti, aspettare conferme, gestire cancellazioni e cercare qualcuno per riempire gli appuntamenti rimasti vuoti.
+
+Ho creato **DriveBot** 🚗: un assistente WhatsApp che fa tutto questo automaticamente — promemoria, conferme, cancellazioni e lista d’attesa — così hai **meno messaggi da gestire e meno ore perse**.
+
+Ti offro **1 settimana di prova gratuita**, senza impegno. Se ti trovi bene, possiamo continuare insieme 😊
+
+Se vuoi, ti mostro come funziona!
+
+ENGLISH:
+
+Hi! 👋 Every day, many instructors waste time reminding students about lessons, waiting for confirmations, handling cancellations, and trying to fill open slots.
+
+I created **DriveBot** 🚗: a WhatsApp assistant that handles all of this automatically—reminders, confirmations, cancellations, and waitlists—so you have **fewer messages to manage and less wasted time**.
+
+I’m offering a **free one-week trial**, with no obligation. If you like it, we can keep working together 😊
+
+If you'd like, I can show you how it works!  
+
+
+IF HE SAYS YES :
+Ciao [Nome]! 👋 Grazie per aver accettato di provare *DriveBot* 🚗 questa settimana!
+
+Da ora, i tuoi studenti riceveranno in automatico i promemoria delle lezioni su WhatsApp e potranno confermare o cancellare rispondendo SI o NO. Se qualcuno cancella, il bot avvisa subito il prossimo in lista d'attesa per riempire lo slot — senza che tu debba fare nulla.
+
+I tuoi studenti possono anche scrivere MENU al numero del bot per vedere tutte le opzioni (lezioni, cancellazioni, cambio orario, lingua).
+
+È tutto gratuito per questa settimana, senza impegno. Se noti qualcosa che non va o hai idee per migliorarlo, scrivimi pure quando vuoi — il tuo feedback conta davvero.
+
+Buona prova! 😊
+
+
+ENG
+
+Hi [Name]! 👋 Thanks for agreeing to try DriveBot 🚗 this week!
+
+From now on, your students will automatically get lesson reminders on WhatsApp and can confirm or cancel by replying SI or NO. If someone cancels, the bot immediately notifies the next person on the waitlist to fill the slot — you don't have to do anything.
+
+Your students can also write MENU to the bot's number to see all the options (lessons, cancellations, rescheduling, language).
+
+It's completely free this week, no strings attached. If you notice anything not working right or have ideas to improve it, message me anytime — your feedback genuinely matters.
+
+Enjoy trying it out! 😊  
