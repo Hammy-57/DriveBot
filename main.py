@@ -17,11 +17,13 @@ from bot_logic import check_and_send_reminders, handle_incoming_message
 from db import get_session, init_db
 from scheduler import start_scheduler
 from admin import ADMIN_PASSWORD, require_login, router as admin_router
+from portal import router as portal_router
 
 load_dotenv()
 
 app = FastAPI(title="DriveBot")
 app.include_router(admin_router)
+app.include_router(portal_router)
 
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 # Set this to your real deployed URL once you're live, e.g.

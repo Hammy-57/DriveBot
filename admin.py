@@ -13,12 +13,13 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, Form, HTTPException
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlmodel import select
 
-from bot_logic import offer_next_waitlist
+import whatsapp as wa
+from bot_logic import TEMPLATE_SIDS, _send_template, _template_vars, offer_next_waitlist
 from db import get_session
 from models import Instructor, Lesson, Student, WaitlistEntry
 
@@ -91,6 +92,37 @@ def normalize_phone(raw: str) -> str:
     return p
 
 
+def _base_url(request: Request) -> str:
+    env = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    return env or str(request.base_url).rstrip("/")
+
+
+def _yes(flag: bool) -> str:
+    return "<span style='color:#5fd38d'>yes</span>" if flag else "<span style='color:#ff6b6b'>NO</span>"
+
+
+def _status_box() -> str:
+    info = wa.status_info()
+    templates = "".join(
+        f"<li>{esc(kind)}: {_yes(bool(sid))}</li>" for kind, sid in TEMPLATE_SIDS.items()
+    )
+    return f"""
+    <div class="card">
+      <strong>System check</strong>
+      <ul style="line-height:1.7">
+        <li>Twilio credentials loaded: {_yes(info['credentials'])}</li>
+        <li>WhatsApp sender: <code>{esc(info['from_number'] or 'NOT SET')}</code></li>
+        <li>Sandbox demo mode (SANDBOX_FREEFORM): {_yes(info['freeform'])} (on = demo only, off = production)</li>
+        <li>Approved template IDs set:<ul>{templates}</ul></li>
+      </ul>
+      <form method="post" action="/admin/test-message">
+        <label>Send a test WhatsApp message to (with country code)</label>
+        <input name="phone" placeholder="+39..." required>
+        <button type="submit">Send test</button>
+      </form>
+    </div>"""
+
+
 def _button(action: str, label: str, danger: bool = True) -> str:
     cls = "small danger" if danger else "small"
     return (f'<form class="inline" method="post" action="{action}">'
@@ -125,14 +157,15 @@ def dashboard(user: str = Depends(require_login)):
         <label>WhatsApp phone (with country code)</label><input name="phone" placeholder="+39..." required>
         <button type="submit">Add instructor</button>
       </form>
-    </div>""")
+    </div>
+    <h2>Setup</h2>{_status_box()}""")
 
 
 @router.post("/instructors")
 def create_instructor(name: str = Form(...), phone: str = Form(...), user: str = Depends(require_login)):
     phone = normalize_phone(phone)
     with get_session() as s:
-        instructor = Instructor(name=name.strip(), phone=phone)
+        instructor = Instructor(name=name.strip(), phone=phone, access_token=secrets.token_urlsafe(16))
         s.add(instructor)
         s.commit()
         s.refresh(instructor)
@@ -141,11 +174,17 @@ def create_instructor(name: str = Form(...), phone: str = Form(...), user: str =
 
 
 @router.get("/instructor/{instructor_id}", response_class=HTMLResponse)
-def instructor_page(instructor_id: int, user: str = Depends(require_login)):
+def instructor_page(instructor_id: int, request: Request, user: str = Depends(require_login)):
     with get_session() as s:
         instructor = s.get(Instructor, instructor_id)
         if instructor is None:
             raise HTTPException(status_code=404, detail="Instructor not found")
+        if not instructor.access_token:
+            instructor.access_token = secrets.token_urlsafe(16)
+            s.add(instructor)
+            s.commit()
+            s.refresh(instructor)
+        portal_link = f"{_base_url(request)}/i/{instructor.access_token}/"
 
         students = s.exec(select(Student).where(Student.instructor_id == instructor_id)).all()
         lessons = s.exec(
@@ -166,7 +205,8 @@ def instructor_page(instructor_id: int, user: str = Depends(require_login)):
         f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td>"
         f"<td>{_local(l.start_time)}</td><td>{esc(l.location or '-')}</td>"
         f"<td><span class='status'>{esc(l.status)}</span></td>"
-        f"<td>{_button(f'/admin/lesson/{l.id}/cancel', 'Cancel') if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-'}</td></tr>"
+        f"<td>{_button(f'/admin/lesson/{l.id}/resend', 'Send reminder now', danger=False) if l.status in ('scheduled', 'confirmed') else ''} "
+        f"{_button(f'/admin/lesson/{l.id}/cancel', 'Cancel') if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-'}</td></tr>"
         for l in lessons
     ) or "<tr><td colspan='5'>No lessons yet.</td></tr>"
 
@@ -185,6 +225,12 @@ def instructor_page(instructor_id: int, user: str = Depends(require_login)):
     <p class="top-link"><a href="/admin">← All instructors</a></p>
     <h1>{esc(instructor.name)}</h1>
     <p style="color:#9a9ca3">{esc(instructor.phone)}</p>
+    <div class="card">
+      <strong>Private page for this instructor</strong>
+      <p>Send him this link on WhatsApp. Anyone with the link can manage <em>only this instructor's</em> students and lessons.</p>
+      <input readonly value="{esc(portal_link)}" onclick="this.select()" style="width:100%">
+      {_button(f'/admin/instructor/{instructor_id}/reset-link', 'Reset link (old link stops working)')}
+    </div>
 
     <h2>Students</h2>
     <table><tr><th>Name</th><th>Phone</th><th>Lang</th><th>Status</th><th></th></tr>{student_rows}</table>
@@ -333,3 +379,59 @@ def deactivate_student(student_id: int, user: str = Depends(require_login)):
         s.commit()
         instructor_id = student.instructor_id
     return RedirectResponse(url=f"/admin/instructor/{instructor_id}", status_code=303)
+
+
+@router.post("/instructor/{instructor_id}/reset-link")
+def reset_link(instructor_id: int, user: str = Depends(require_login)):
+    with get_session() as s:
+        instructor = _require_instructor(s, instructor_id)
+        instructor.access_token = secrets.token_urlsafe(16)
+        s.add(instructor)
+        s.commit()
+    return RedirectResponse(url=f"/admin/instructor/{instructor_id}", status_code=303)
+
+
+def _result_page(ok: bool, title: str, detail: str, back: str) -> HTMLResponse:
+    color = "#5fd38d" if ok else "#ff6b6b"
+    return HTMLResponse(_page(title, f"""
+    <p class="top-link"><a href="{esc(back)}">← Back</a></p>
+    <h1 style="color:{color}">{'✅' if ok else '❌'} {esc(title)}</h1>
+    <div class="card"><p>{detail}</p></div>"""))
+
+
+@router.post("/test-message", response_class=HTMLResponse)
+def test_message(phone: str = Form(...), user: str = Depends(require_login)):
+    phone = normalize_phone(phone)
+    ok = wa.send_whatsapp_message(phone, "✅ DriveBot: test message. If you can read this, Twilio is connected correctly.")
+    if ok:
+        return _result_page(True, "Sent to Twilio", f"Twilio accepted the message for {esc(phone)}. Check that phone's WhatsApp.", "/admin/")
+    hint = ""
+    err = wa.last_error or "unknown error"
+    if "63015" in err or "sandbox" in err.lower():
+        hint = "<p><strong>Meaning:</strong> this phone has not joined the Sandbox (or joined more than 24h ago). From that phone, send the join code to the Sandbox number again.</p>"
+    elif "20003" in err or "authenticate" in err.lower():
+        hint = "<p><strong>Meaning:</strong> wrong TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN.</p>"
+    elif "63007" in err or "from" in err.lower():
+        hint = "<p><strong>Meaning:</strong> TWILIO_WHATSAPP_NUMBER is not a valid WhatsApp sender. Copy it from your Sandbox page.</p>"
+    return _result_page(False, "Send failed", f"<code>{esc(err)}</code>{hint}", "/admin/")
+
+
+@router.post("/lesson/{lesson_id}/resend", response_class=HTMLResponse)
+def resend_reminder(lesson_id: int, user: str = Depends(require_login)):
+    """Send the 24h reminder right now (ignores the 24h window and 'already sent')."""
+    with get_session() as s:
+        lesson = s.get(Lesson, lesson_id)
+        if lesson is None:
+            raise HTTPException(status_code=404, detail="Lesson not found")
+        student = s.get(Student, lesson.student_id)
+        back = f"/admin/instructor/{lesson.instructor_id}"
+        if student is None or not student.active:
+            return _result_page(False, "No active student", "This lesson has no active student.", back)
+        ok = _send_template("reminder_24h", student.phone, _template_vars(student, lesson))
+        if ok:
+            lesson.reminder_24h_sent = True
+            lesson.awaiting_reply = True
+            s.add(lesson)
+            s.commit()
+            return _result_page(True, "Reminder sent", f"Sent to {esc(student.name)} ({esc(student.phone)}). They can reply SI or NO.", back)
+        return _result_page(False, "Send failed", f"<code>{esc(wa.last_error or 'unknown error')}</code>", back)

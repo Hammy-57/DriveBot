@@ -13,6 +13,8 @@ class Instructor(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     phone: str  # WhatsApp number, e.g. "+393331234567"
+    # secret in the instructor's private page link: /i/<access_token>
+    access_token: Optional[str] = Field(default=None, index=True)
 
 
 class Student(SQLModel, table=True):

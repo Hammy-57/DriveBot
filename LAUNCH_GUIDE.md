@@ -21,3 +21,12 @@ ADMIN_USERNAME, ADMIN_PASSWORD (strong). SANDBOX_FREEFORM only for Sandbox demos
 3. curl -u admin:PASS -X POST https://YOUR-URL/run-reminders-now -> your phone gets the reminder
 4. Reply SI, then NO, then check the admin panel shows the new status
 5. If replies stop and the host logs show 403: PUBLIC_BASE_URL does not exactly match the URL in Twilio.
+
+## Private page for each instructor (no password to remember)
+Admin -> open the instructor -> copy the "Private page" link -> send it to him on WhatsApp.
+He can add students/lessons/waitlist and cancel lessons, but sees only his own data.
+"Reset link" makes the old link stop working. Treat the link like a password.
+
+## Diagnosing "no message received"
+Admin home -> "System check" shows whether Twilio is configured. "Send test" shows Twilio's exact error.
+On a lesson row, "Send reminder now" sends the reminder immediately and shows the error if it fails.
