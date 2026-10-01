@@ -27,6 +27,8 @@ Design choices, on purpose:
 """
 import logging
 import os
+import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -34,7 +36,9 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from sqlmodel import Session, select
 
+import whatsapp as _wa
 from models import Instructor, Lesson, Student, WaitlistEntry
+from phones import normalize_phone as _norm_phone
 from whatsapp import send_whatsapp_message, send_whatsapp_template
 
 load_dotenv()
@@ -54,6 +58,7 @@ TEMPLATE_TEXTS = {
     "reminder_24h": "Ciao {{1}}! Hai una lezione di guida il {{2}} alle {{3}}. Luogo: {{4}}. Rispondi SI per confermare o NO per cancellare.",
     "reminder_2h": "Ciao {{1}}, promemoria: la tua lezione del {{2}} e' tra circa 2 ore, alle {{3}}. Luogo: {{4}}. A dopo!",
     "waitlist_offer": "Ciao {{1}}! Si e' liberato uno slot per il {{2}} alle {{3}}. Luogo: {{4}}. Lo vuoi? Rispondi SI o NO.",
+    "student_welcome": "Ciao {{1}}! Sono l'assistente WhatsApp del tuo istruttore {{2}}. Ti mandero' qui i promemoria delle tue lezioni di guida. Rispondi MENU per le opzioni oppure STOP per non ricevere piu' messaggi.",
     "instructor_notice": "Aggiornamento DriveBot per il tuo calendario: {{1}} Rispondi a questo messaggio per continuare a ricevere gli avvisi in chat.",
 }
 # Content SIDs ("HX...") of the approved templates, from your .env.
@@ -62,6 +67,7 @@ TEMPLATE_SIDS = {
     "reminder_2h": os.getenv("TWILIO_TEMPLATE_REMINDER_2H"),
     "waitlist_offer": os.getenv("TWILIO_TEMPLATE_WAITLIST_OFFER"),
     "instructor_notice": os.getenv("TWILIO_TEMPLATE_INSTRUCTOR_NOTICE"),
+    "student_welcome": os.getenv("TWILIO_TEMPLATE_STUDENT_WELCOME"),
 }
 
 CONFIRM_WORDS = {"si", "sì", "yes", "s", "ok", "va bene", "y"}
@@ -71,6 +77,13 @@ CANCEL_WORDS = {"no", "n", "annulla", "cancella", "cancel", "2"}
 AMBIGUOUS_CANCEL_WORDS = {"no", "n"}
 RESCHEDULE_WORDS = {"riprogramma", "reschedule", "cambia", "cambiare", "spostare", "3"}
 MENU_WORDS = {"menu", "help", "aiuto", "4"}
+STOP_WORDS = {"stop", "basta", "unsubscribe"}
+
+# Instructor commands (sent from the instructor's own WhatsApp number)
+ADD_WORDS = {"aggiungi", "add", "nuovo", "nuova"}
+REMOVE_WORDS = {"rimuovi", "remove", "elimina", "togli"}
+LIST_WORDS = {"lista", "allievi", "studenti", "students", "list"}
+LINK_WORDS = {"pagina", "link", "sito"}
 MY_LESSONS_WORDS = {
     "1", "le mie lezioni", "my lessons", "lezioni", "lezione",
     "prossima", "prossima lezione", "quando", "quando e la lezione", "when",
@@ -101,6 +114,7 @@ MESSAGES = {
         "waitlist_declined": "Nessun problema, grazie per aver risposto!",
         "waitlist_unclear": "Rispondi SI se vuoi prendere questo slot, oppure NO se non ti interessa.",
         "waitlist_unavailable": "Purtroppo questo slot non e' piu' disponibile. Ti avviseremo se ne libera un altro.",
+        "stopped": "Ok, non riceverai piu' messaggi da questo servizio. Se cambi idea, chiedi al tuo istruttore di riaggiungerti.",
         "cancel_hint": "Se vuoi cancellare la lezione scrivi ANNULLA. Scrivi MENU per le altre opzioni.",
     },
     "en": {
@@ -120,6 +134,7 @@ MESSAGES = {
         "waitlist_declined": "No problem, thanks for letting us know!",
         "waitlist_unclear": "Reply YES if you want this slot, or NO if you're not interested.",
         "waitlist_unavailable": "Sorry, this slot is no longer available. We'll let you know if another one opens up.",
+        "stopped": "Okay, you won't receive any more messages from this service. If you change your mind, ask your instructor to add you again.",
         "cancel_hint": "To cancel your lesson write CANCEL. Write MENU for the other options.",
     },
 }
@@ -268,10 +283,26 @@ def handle_incoming_message(session: Session, from_phone: str, body: str) -> str
     text = body.strip().lower()
 
     student = session.exec(select(Student).where(Student.phone == phone)).first()
-    if student is None or not student.active:
+    is_active_student = student is not None and student.active
+
+    instructor = session.exec(select(Instructor).where(Instructor.phone == phone)).first()
+    if instructor is not None:
+        reply = _handle_instructor_message(session, instructor, body, also_student=is_active_student)
+        if reply is not None:
+            return reply
+
+    if not is_active_student:
         return t("it", "not_registered")
 
     lang = student.language
+
+    if text in STOP_WORDS:
+        student.active = False
+        session.add(student)
+        session.commit()
+        _notify_instructor(session, student.instructor_id,
+                           f"🚫 {student.name} ha chiesto di non ricevere piu' messaggi (STOP). E' stato rimosso dai promemoria.")
+        return t(lang, "stopped")
 
     if text in ENGLISH_WORDS:
         student.language = "en"
@@ -460,3 +491,153 @@ def expire_stale_offers(session: Session, now: datetime) -> None:
         session.commit()
         if lesson is not None and lesson.status == "cancelled":
             offer_next_waitlist(session, lesson)
+
+
+# ---------------------------------------------------------------------
+# 4. Sending a reminder on demand (admin buttons, "now" / "in 2 minutes")
+# ---------------------------------------------------------------------
+
+def send_reminder_now(session: Session, lesson: Lesson) -> tuple[bool, str | None]:
+    """Send the reminder immediately, ignoring the 24h window. Returns (ok, error_text)."""
+    student = session.get(Student, lesson.student_id)
+    if student is None or not student.active:
+        return False, "This lesson has no active student."
+    if _aware(lesson.start_time) <= datetime.now(timezone.utc):
+        return False, "This lesson is already in the past."
+    if _send_template("reminder_24h", student.phone, _template_vars(student, lesson)):
+        lesson.reminder_24h_sent = True
+        lesson.awaiting_reply = True
+        session.add(lesson)
+        session.commit()
+        return True, None
+    return False, _wa.last_error or "unknown error"
+
+
+# ---------------------------------------------------------------------
+# 5. Instructor commands over WhatsApp (add students without the website)
+# ---------------------------------------------------------------------
+
+INSTRUCTOR_HELP = (
+    "Ciao {name}! Ecco cosa puoi scrivermi:\n\n"
+    "➕ aggiungi Giulia +393331234567\n"
+    "    (aggiungi \"inglese\" in fondo se preferisce l'inglese)\n"
+    "👥 lista - i tuoi allievi\n"
+    "➖ rimuovi Giulia - togli un allievo\n"
+    "🔗 pagina - il tuo link privato per le lezioni\n\n"
+    "Prima di aggiungere qualcuno, assicurati che sia d'accordo a ricevere i promemoria su WhatsApp."
+)
+ADD_FORMAT = "Non ho capito. Scrivi cosi': aggiungi Giulia +393331234567"
+
+
+def _handle_instructor_message(session: Session, instructor: Instructor, body: str, also_student: bool) -> str | None:
+    """
+    Returns the reply text, or None to let the normal student flow handle the
+    message (only when this person is ALSO a student and wrote something that
+    isn't an instructor command -- e.g. an instructor testing with one phone).
+    """
+    text = body.strip()
+    first, _, rest = text.partition(" ")
+    cmd = first.lower().rstrip(":")
+    rest = rest.strip()
+
+    if cmd in ADD_WORDS:
+        return _instructor_add_student(session, instructor, rest)
+    if cmd in REMOVE_WORDS:
+        return _instructor_remove_student(session, instructor, rest)
+    if text.lower() in LIST_WORDS:
+        return _instructor_list_students(session, instructor)
+    if cmd in LINK_WORDS and not rest:
+        return _instructor_link(session, instructor)
+    if text.lower() in {"comandi", "istruttore", "commands"}:
+        return INSTRUCTOR_HELP.format(name=instructor.name)
+    if also_student:
+        return None
+    return INSTRUCTOR_HELP.format(name=instructor.name)
+
+
+def _instructor_add_student(session: Session, instructor: Instructor, rest: str) -> str:
+    parts = rest.split()
+    lang = "it"
+    if parts and parts[-1].lower() in ("en", "inglese", "english"):
+        lang, parts = "en", parts[:-1]
+    elif parts and parts[-1].lower() in ("it", "italiano", "italian"):
+        parts = parts[:-1]
+    cleaned = " ".join(parts)
+
+    match = re.search(r"(\+?\d[\d\s\-\.]{6,}\d)$", cleaned)
+    if not match:
+        return ADD_FORMAT
+    name = cleaned[:match.start()].strip(" ,:;-")
+    if not name or len(name) > 60:
+        return ADD_FORMAT
+    try:
+        phone = _norm_phone(match.group(1))
+    except ValueError:
+        return "Il numero non sembra valido. Scrivilo con il prefisso, ad esempio +393331234567."
+
+    existing = session.exec(select(Student).where(Student.phone == phone)).first()
+    if existing is not None:
+        if existing.instructor_id != instructor.id:
+            return f"Il numero {phone} risulta gia' registrato con un altro istruttore."
+        if existing.active:
+            return f"{existing.name} e' gia' nella tua lista."
+        existing.active = True
+        existing.name = name
+        existing.language = lang
+        session.add(existing)
+        session.commit()
+    else:
+        session.add(Student(name=name, phone=phone, instructor_id=instructor.id, language=lang))
+        session.commit()
+
+    welcomed = _send_template("student_welcome", phone, {"1": name, "2": instructor.name})
+    if welcomed:
+        return f"✅ {name} aggiunto/a ({phone}). Ho inviato un messaggio di benvenuto."
+    return (f"✅ {name} aggiunto/a ({phone}), ma non sono riuscito a inviare il messaggio di benvenuto. "
+            f"Chiedi a {name} di scrivere \"ciao\" a questo numero.")
+
+
+def _instructor_remove_student(session: Session, instructor: Instructor, rest: str) -> str:
+    if not rest:
+        return "Scrivi: rimuovi Giulia (oppure rimuovi +393331234567)"
+    mine = session.exec(
+        select(Student).where(Student.instructor_id == instructor.id, Student.active == True)  # noqa: E712
+    ).all()
+    try:
+        wanted_phone = _norm_phone(rest)
+    except ValueError:
+        wanted_phone = None
+    matches = [s for s in mine if s.phone == wanted_phone] if wanted_phone else \
+              [s for s in mine if s.name.strip().lower() == rest.strip().lower()]
+    if not matches:
+        return f"Non trovo nessun allievo attivo chiamato \"{rest}\". Scrivi LISTA per vedere i tuoi allievi."
+    if len(matches) > 1:
+        return "Ci sono piu' allievi con questo nome: usa il numero, ad esempio rimuovi +393331234567."
+    student = matches[0]
+    student.active = False
+    session.add(student)
+    session.commit()
+    return f"✅ {student.name} rimosso/a. Non ricevera' piu' messaggi."
+
+
+def _instructor_list_students(session: Session, instructor: Instructor) -> str:
+    mine = session.exec(
+        select(Student).where(Student.instructor_id == instructor.id, Student.active == True)  # noqa: E712
+        .order_by(Student.name)
+    ).all()
+    if not mine:
+        return "Non hai ancora allievi. Scrivi: aggiungi Giulia +393331234567"
+    lines = [f"• {s.name} {s.phone}" for s in mine[:40]]
+    extra = f"\n... e altri {len(mine) - 40}" if len(mine) > 40 else ""
+    return f"👥 I tuoi allievi ({len(mine)}):\n" + "\n".join(lines) + extra
+
+
+def _instructor_link(session: Session, instructor: Instructor) -> str:
+    base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        return "Il link non e' ancora disponibile. Chiedi a chi ti ha attivato il servizio."
+    if not instructor.access_token:
+        instructor.access_token = secrets.token_urlsafe(16)
+        session.add(instructor)
+        session.commit()
+    return f"🔗 La tua pagina privata (non condividerla con nessuno):\n{base}/i/{instructor.access_token}/"

@@ -19,7 +19,9 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlmodel import select
 
 import whatsapp as wa
-from bot_logic import TEMPLATE_SIDS, _send_template, _template_vars, offer_next_waitlist
+from bot_logic import TEMPLATE_SIDS, offer_next_waitlist, send_reminder_now
+from phones import normalize_phone as _normalize
+from scheduler import schedule_reminder
 from db import get_session
 from models import Instructor, Lesson, Student, WaitlistEntry
 
@@ -64,6 +66,12 @@ PAGE_STYLE = """
   button.small { padding:4px 10px; font-size:0.8rem; margin-top:0; }
   .status { font-size:0.78rem; padding:2px 8px; border-radius:10px; background:#2a2b30; }
   .top-link { font-size: 0.85rem; }
+
+.stats{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+.stat{background:#1e1f25;border:1px solid #2c2d34;border-radius:10px;padding:10px 16px;min-width:110px}
+.stat b{display:block;font-size:24px;color:#f5c542}
+.stat span{font-size:12px;color:#9a9ca3}
+details{margin:8px 0}summary{cursor:pointer;color:#9a9ca3;padding:6px 0}
 </style>
 """
 
@@ -75,21 +83,10 @@ def _local(dt: datetime) -> str:
 
 
 def normalize_phone(raw: str) -> str:
-    """
-    '333 123 4567' -> '+393331234567'; '0039333...' -> '+39333...'.
-    Must match how WhatsApp/Twilio report the sender, or the student
-    would be told "number not recognised".
-    """
-    p = re.sub(r"[\s\-\.\(\)]", "", raw or "")
-    if p.startswith("whatsapp:"):
-        p = p[len("whatsapp:"):]
-    if p.startswith("00"):
-        p = "+" + p[2:]
-    if not p.startswith("+") and re.fullmatch(r"3\d{8,9}", p):
-        p = "+39" + p  # Italian mobile without country code
-    if not re.fullmatch(r"\+\d{8,15}", p):
+    try:
+        return _normalize(raw)
+    except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid phone number: {raw!r}. Use the format +393331234567.")
-    return p
 
 
 def _base_url(request: Request) -> str:
@@ -123,6 +120,28 @@ def _status_box() -> str:
     </div>"""
 
 
+def _last_error_banner() -> str:
+    if not wa.last_error:
+        return ""
+    return (f'<div class="card" style="border-color:#ff6b6b"><strong style="color:#ff6b6b">Last WhatsApp sending problem</strong>'
+            f'<p><code>{esc(wa.last_error)}</code></p></div>')
+
+
+def stat_cards(items) -> str:
+    return '<div class="stats">' + "".join(f'<div class="stat"><b>{v}</b><span>{esc(lbl)}</span></div>' for v, lbl in items) + "</div>"
+
+
+def split_lessons(lessons):
+    """(upcoming sorted soonest-first, everything else newest-first)."""
+    now = datetime.now(timezone.utc)
+    def aware(dt):
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    live = ("scheduled", "confirmed", "reschedule_requested")
+    upcoming = sorted([l for l in lessons if l.status in live and aware(l.start_time) > now], key=lambda l: l.start_time)
+    past = sorted([l for l in lessons if l not in upcoming], key=lambda l: l.start_time, reverse=True)
+    return upcoming, past
+
+
 def _button(action: str, label: str, danger: bool = True) -> str:
     cls = "small danger" if danger else "small"
     return (f'<form class="inline" method="post" action="{action}">'
@@ -133,6 +152,54 @@ def _page(title: str, body: str) -> str:
     return (f'<!DOCTYPE html><html><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<title>{esc(title)}</title>{PAGE_STYLE}</head><body>{body}</body></html>')
+
+
+def error_page(status: int, message: str, back: str = "/admin/", it: bool = False) -> str:
+    if it:
+        title, back_label = "Qualcosa non ha funzionato", "← Indietro"
+        if status >= 500:
+            message = "Errore del server. Riprova tra poco; se continua, avvisa chi ti ha attivato il servizio."
+    else:
+        title, back_label = "Something went wrong", "← Back"
+        if status >= 500:
+            message = "Server error. The details were logged. Try again, and if it keeps happening check the Railway Deploy Logs."
+    return _page(title, f"""
+    <p class="top-link"><a href="{esc(back)}">{back_label}</a></p>
+    <h1 style="color:#ff6b6b">❌ {esc(title)}</h1>
+    <div class="card"><p>{esc(message)}</p><p style="color:#9a9ca3;font-size:13px">Error {status}</p></div>""")
+
+
+def _result_page(ok: bool, title: str, detail: str, back: str, back_label: str = "← Back") -> HTMLResponse:
+    color = "#5fd38d" if ok else "#ff6b6b"
+    return HTMLResponse(_page(title, f"""
+    <p class="top-link"><a href="{esc(back)}">{back_label}</a></p>
+    <h1 style="color:{color}">{'✅' if ok else '❌'} {esc(title)}</h1>
+    <div class="card"><p>{detail}</p></div>"""))
+
+
+def apply_reminder_choice(lesson_id: int, choice: str, back: str, it: bool = False):
+    """
+    After creating a lesson: 'now' sends the reminder immediately, '2min' schedules it
+    2 minutes from now, anything else = automatic (24h and 2h before) -> returns None.
+    """
+    lbl = "← Indietro" if it else "← Back"
+    if choice == "2min":
+        run_at = schedule_reminder(lesson_id, 120).astimezone(LOCAL_TZ).strftime("%H:%M")
+        if it:
+            return _result_page(True, "Promemoria programmato", f"Lezione aggiunta. Il promemoria partira' alle {run_at} (tra circa 2 minuti).", back, lbl)
+        return _result_page(True, "Reminder scheduled", f"Lesson added. The reminder will be sent at {run_at} Rome time (in about 2 minutes). "
+                            "If it doesn't arrive, check <em>System check</em> on the admin home page and Railway's Deploy Logs. "
+                            "Note: if the server restarts before then, it is skipped.", back, lbl)
+    if choice == "now":
+        with get_session() as s:
+            lesson = s.get(Lesson, lesson_id)
+            ok, err = send_reminder_now(s, lesson)
+        if ok:
+            return _result_page(True, "Promemoria inviato" if it else "Reminder sent",
+                                "Lezione aggiunta e promemoria inviato." if it else "Lesson added and the reminder was sent. The student can reply SI or NO.", back, lbl)
+        return _result_page(False, "Invio non riuscito" if it else "Lesson added, but the reminder failed",
+                            ("La lezione e' stata aggiunta, ma il promemoria non e' partito: " if it else "The lesson was saved, but sending failed: ") + f"<code>{esc(err or '')}</code>", back, lbl)
+    return None
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -158,6 +225,7 @@ def dashboard(user: str = Depends(require_login)):
         <button type="submit">Add instructor</button>
       </form>
     </div>
+    {_last_error_banner()}
     <h2>Setup</h2>{_status_box()}""")
 
 
@@ -201,14 +269,25 @@ def instructor_page(instructor_id: int, request: Request, user: str = Depends(re
         for st in students
     ) or "<tr><td colspan='5'>No students yet.</td></tr>"
 
-    lesson_rows = "".join(
-        f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td>"
-        f"<td>{_local(l.start_time)}</td><td>{esc(l.location or '-')}</td>"
-        f"<td><span class='status'>{esc(l.status)}</span></td>"
-        f"<td>{_button(f'/admin/lesson/{l.id}/resend', 'Send reminder now', danger=False) if l.status in ('scheduled', 'confirmed') else ''} "
-        f"{_button(f'/admin/lesson/{l.id}/cancel', 'Cancel') if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-'}</td></tr>"
-        for l in lessons
-    ) or "<tr><td colspan='5'>No lessons yet.</td></tr>"
+    def lesson_row(l):
+        return (f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td>"
+                f"<td>{_local(l.start_time)}</td><td>{esc(l.location or '-')}</td>"
+                f"<td><span class='status'>{esc(l.status)}</span></td>"
+                f"<td>{_button(f'/admin/lesson/{l.id}/resend', 'Send now', danger=False) + _button(f'/admin/lesson/{l.id}/remind-later', 'Send in 2 min', danger=False) if l.status in ('scheduled', 'confirmed') else ''} "
+                f"{_button(f'/admin/lesson/{l.id}/cancel', 'Cancel') if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-'}</td></tr>")
+
+    upcoming, past = split_lessons(lessons)
+    head = "<tr><th>Student</th><th>When (Rome time)</th><th>Location</th><th>Status</th><th></th></tr>"
+    upcoming_html = f"<table>{head}{''.join(lesson_row(l) for l in upcoming) or '<tr><td colspan=5>No upcoming lessons.</td></tr>'}</table>"
+    past_html = (f"<details><summary>Past and cancelled lessons ({len(past)})</summary><table>{head}"
+                 f"{''.join(lesson_row(l) for l in past)}</table></details>") if past else ""
+    cards = stat_cards([
+        (len(upcoming), "upcoming lessons"),
+        (sum(1 for l in upcoming if l.status == "confirmed"), "confirmed"),
+        (sum(1 for l in upcoming if l.status == "scheduled"), "waiting for reply"),
+        (sum(1 for l in upcoming if l.status == "reschedule_requested"), "want to reschedule"),
+        (sum(1 for st in students if st.active), "active students"),
+    ])
 
     waitlist_rows = "".join(
         f"<tr><td>{esc(name_of.get(w.student_id, '?'))}</td>"
@@ -246,7 +325,7 @@ def instructor_page(instructor_id: int, request: Request, user: str = Depends(re
     </div>
 
     <h2>Lessons</h2>
-    <table><tr><th>Student</th><th>When (Rome time)</th><th>Location</th><th>Status</th><th></th></tr>{lesson_rows}</table>
+    {cards}{upcoming_html}{past_html}
     <div class="card">
       <strong>Schedule lesson</strong>
       <form method="post" action="/admin/instructor/{instructor_id}/lessons">
@@ -256,6 +335,12 @@ def instructor_page(instructor_id: int, request: Request, user: str = Depends(re
         <input type="datetime-local" name="when" required>
         <label>Location (optional)</label>
         <input name="location" placeholder="Via Roma 25, Cassino">
+        <label>Reminder to the student</label>
+        <select name="reminder">
+          <option value="auto">Automatic (24h and 2h before)</option>
+          <option value="now">Send right now</option>
+          <option value="2min">Send in 2 minutes</option>
+        </select>
         <button type="submit">Schedule lesson</button>
       </form>
     </div>
@@ -304,7 +389,7 @@ def create_student(instructor_id: int, name: str = Form(...), phone: str = Form(
 
 @router.post("/instructor/{instructor_id}/lessons")
 def create_lesson(instructor_id: int, student_id: int = Form(...), when: str = Form(...),
-                  location: str = Form(""), user: str = Depends(require_login)):
+                  location: str = Form(""), reminder: str = Form("auto"), user: str = Depends(require_login)):
     # datetime-local sends "YYYY-MM-DDTHH:MM" (some browsers add seconds); it is Rome local time
     local_dt = None
     for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
@@ -321,10 +406,14 @@ def create_lesson(instructor_id: int, student_id: int = Form(...), when: str = F
     with get_session() as s:
         _require_instructor(s, instructor_id)
         _require_own_student(s, instructor_id, student_id)
-        s.add(Lesson(instructor_id=instructor_id, student_id=student_id,
-                     start_time=utc_dt, location=(location.strip() or None)))
+        lesson = Lesson(instructor_id=instructor_id, student_id=student_id,
+                        start_time=utc_dt, location=(location.strip() or None))
+        s.add(lesson)
         s.commit()
-    return RedirectResponse(url=f"/admin/instructor/{instructor_id}", status_code=303)
+        s.refresh(lesson)
+        lesson_id = lesson.id
+    back = f"/admin/instructor/{instructor_id}"
+    return apply_reminder_choice(lesson_id, reminder, back) or RedirectResponse(url=back, status_code=303)
 
 
 @router.post("/instructor/{instructor_id}/waitlist")
@@ -391,14 +480,6 @@ def reset_link(instructor_id: int, user: str = Depends(require_login)):
     return RedirectResponse(url=f"/admin/instructor/{instructor_id}", status_code=303)
 
 
-def _result_page(ok: bool, title: str, detail: str, back: str) -> HTMLResponse:
-    color = "#5fd38d" if ok else "#ff6b6b"
-    return HTMLResponse(_page(title, f"""
-    <p class="top-link"><a href="{esc(back)}">← Back</a></p>
-    <h1 style="color:{color}">{'✅' if ok else '❌'} {esc(title)}</h1>
-    <div class="card"><p>{detail}</p></div>"""))
-
-
 @router.post("/test-message", response_class=HTMLResponse)
 def test_message(phone: str = Form(...), user: str = Depends(require_login)):
     phone = normalize_phone(phone)
@@ -418,20 +499,24 @@ def test_message(phone: str = Form(...), user: str = Depends(require_login)):
 
 @router.post("/lesson/{lesson_id}/resend", response_class=HTMLResponse)
 def resend_reminder(lesson_id: int, user: str = Depends(require_login)):
-    """Send the 24h reminder right now (ignores the 24h window and 'already sent')."""
+    """Send the reminder right now (ignores the 24h window and 'already sent')."""
     with get_session() as s:
         lesson = s.get(Lesson, lesson_id)
         if lesson is None:
             raise HTTPException(status_code=404, detail="Lesson not found")
-        student = s.get(Student, lesson.student_id)
         back = f"/admin/instructor/{lesson.instructor_id}"
-        if student is None or not student.active:
-            return _result_page(False, "No active student", "This lesson has no active student.", back)
-        ok = _send_template("reminder_24h", student.phone, _template_vars(student, lesson))
+        student = s.get(Student, lesson.student_id)
+        ok, err = send_reminder_now(s, lesson)
         if ok:
-            lesson.reminder_24h_sent = True
-            lesson.awaiting_reply = True
-            s.add(lesson)
-            s.commit()
             return _result_page(True, "Reminder sent", f"Sent to {esc(student.name)} ({esc(student.phone)}). They can reply SI or NO.", back)
-        return _result_page(False, "Send failed", f"<code>{esc(wa.last_error or 'unknown error')}</code>", back)
+        return _result_page(False, "Send failed", f"<code>{esc(err or 'unknown error')}</code>", back)
+
+
+@router.post("/lesson/{lesson_id}/remind-later", response_class=HTMLResponse)
+def remind_later(lesson_id: int, user: str = Depends(require_login)):
+    with get_session() as s:
+        lesson = s.get(Lesson, lesson_id)
+        if lesson is None:
+            raise HTTPException(status_code=404, detail="Lesson not found")
+        back = f"/admin/instructor/{lesson.instructor_id}"
+    return apply_reminder_choice(lesson_id, "2min", back)

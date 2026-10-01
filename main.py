@@ -9,14 +9,17 @@ import os
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
 from bot_logic import check_and_send_reminders, handle_incoming_message
 from db import get_session, init_db
 from scheduler import start_scheduler
-from admin import ADMIN_PASSWORD, require_login, router as admin_router
+from admin import ADMIN_PASSWORD, error_page, require_login, router as admin_router
 from portal import router as portal_router
 
 load_dotenv()
@@ -31,6 +34,47 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
 log = logging.getLogger("drivebot")
+
+def _is_ui(request: Request) -> bool:
+    path = request.url.path
+    return path.startswith("/admin") or path.startswith("/i/")
+
+
+def _back_for(request: Request) -> str:
+    parts = request.url.path.split("/")
+    if request.url.path.startswith("/i/") and len(parts) > 2 and parts[2]:
+        return f"/i/{parts[2]}/"
+    if request.url.path.startswith("/admin/instructor/") and len(parts) > 3 and parts[3].isdigit():
+        return f"/admin/instructor/{parts[3]}"
+    return "/admin/"
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(request: Request, exc: StarletteHTTPException):
+    # 401 must stay as-is so the browser shows its login box.
+    if _is_ui(request) and exc.status_code != 401:
+        return HTMLResponse(error_page(exc.status_code, str(exc.detail), _back_for(request),
+                                       it=request.url.path.startswith("/i/")), status_code=exc.status_code)
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    if _is_ui(request):
+        msg = "Some fields are missing or invalid. Go back and check the form."
+        if request.url.path.startswith("/i/"):
+            msg = "Alcuni campi mancano o non sono validi. Torna indietro e controlla."
+        return HTMLResponse(error_page(422, msg, _back_for(request), it=request.url.path.startswith("/i/")), status_code=422)
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error(request: Request, exc: Exception):
+    log.exception("Unhandled error on %s", request.url.path)
+    if _is_ui(request):
+        return HTMLResponse(error_page(500, "", _back_for(request), it=request.url.path.startswith("/i/")), status_code=500)
+    return Response("Internal Server Error", status_code=500)
+
 
 _validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 

@@ -14,7 +14,7 @@ from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlmodel import select
 
-from admin import LOCAL_TZ, PAGE_STYLE, _button, _local, esc, normalize_phone
+from admin import LOCAL_TZ, PAGE_STYLE, _button, _local, apply_reminder_choice, esc, normalize_phone, split_lessons, stat_cards
 from bot_logic import offer_next_waitlist
 from db import get_session
 from models import Instructor, Lesson, Student, WaitlistEntry
@@ -78,12 +78,23 @@ def portal_home(token: str):
         for st in students
     ) or "<tr><td colspan='4'>Nessun allievo.</td></tr>"
 
-    lesson_rows = "".join(
-        f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td><td>{_local(l.start_time)}</td>"
-        f"<td>{esc(l.location or '-')}</td><td><span class='status'>{esc(STATUS_IT.get(l.status, l.status))}</span></td>"
-        f"<td>{_button(f'{base}/lesson/{l.id}/cancel', 'Cancella') if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-'}</td></tr>"
-        for l in lessons
-    ) or "<tr><td colspan='5'>Nessuna lezione.</td></tr>"
+    def lesson_row(l):
+        return (f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td><td>{_local(l.start_time)}</td>"
+                f"<td>{esc(l.location or '-')}</td><td><span class='status'>{esc(STATUS_IT.get(l.status, l.status))}</span></td>"
+                f"<td>{_button(f'{base}/lesson/{l.id}/cancel', 'Cancella') if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-'}</td></tr>")
+
+    upcoming, past = split_lessons(lessons)
+    head = "<tr><th>Allievo</th><th>Quando</th><th>Luogo</th><th>Stato</th><th></th></tr>"
+    upcoming_html = f"<table>{head}{''.join(lesson_row(l) for l in upcoming) or '<tr><td colspan=5>Nessuna lezione in programma.</td></tr>'}</table>"
+    past_html = (f"<details><summary>Lezioni passate e cancellate ({len(past)})</summary><table>{head}"
+                 f"{''.join(lesson_row(l) for l in past)}</table></details>") if past else ""
+    cards = stat_cards([
+        (len(upcoming), "lezioni in programma"),
+        (sum(1 for l in upcoming if l.status == "confirmed"), "confermate"),
+        (sum(1 for l in upcoming if l.status == "scheduled"), "in attesa di risposta"),
+        (sum(1 for l in upcoming if l.status == "reschedule_requested"), "vogliono spostare"),
+        (sum(1 for st in students if st.active), "allievi attivi"),
+    ])
 
     waitlist_rows = "".join(
         f"<tr><td>{esc(name_of.get(w.student_id, '?'))}</td>"
@@ -101,12 +112,18 @@ def portal_home(token: str):
     Se qualcuno cancella, lo slot viene proposto alla lista d'attesa. Le lezioni si leggono in ora italiana.</p>
 
     <h2>Lezioni</h2>
-    <table><tr><th>Allievo</th><th>Quando</th><th>Luogo</th><th>Stato</th><th></th></tr>{lesson_rows}</table>
+    {cards}{upcoming_html}{past_html}
     <div class="card"><strong>Nuova lezione</strong>
       <form method="post" action="{base}/lessons">
         <label>Allievo</label><select name="student_id" required>{opts or no_opts}</select>
         <label>Data e ora</label><input type="datetime-local" name="when" required>
         <label>Luogo (facoltativo)</label><input name="location" placeholder="Via Roma 25, Cassino">
+        <label>Promemoria all'allievo</label>
+        <select name="reminder">
+          <option value="auto">Automatico (24 ore e 2 ore prima)</option>
+          <option value="now">Invia subito</option>
+          <option value="2min">Invia tra 2 minuti</option>
+        </select>
         <button type="submit">Aggiungi lezione</button>
       </form></div>
 
@@ -149,7 +166,8 @@ def add_student(token: str, name: str = Form(...), phone: str = Form(...), langu
 
 
 @router.post("/lessons")
-def add_lesson(token: str, student_id: int = Form(...), when: str = Form(...), location: str = Form("")):
+def add_lesson(token: str, student_id: int = Form(...), when: str = Form(...), location: str = Form(""),
+               reminder: str = Form("auto")):
     local_dt = None
     for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
         try:
@@ -165,9 +183,12 @@ def add_lesson(token: str, student_id: int = Form(...), when: str = Form(...), l
     with get_session() as s:
         inst = _instructor(s, token)
         _own_student(s, inst, student_id)
-        s.add(Lesson(instructor_id=inst.id, student_id=student_id, start_time=utc_dt, location=(location.strip() or None)))
+        lesson = Lesson(instructor_id=inst.id, student_id=student_id, start_time=utc_dt, location=(location.strip() or None))
+        s.add(lesson)
         s.commit()
-    return _back(token)
+        s.refresh(lesson)
+        lesson_id = lesson.id
+    return apply_reminder_choice(lesson_id, reminder, f"/i/{token}/", it=True) or _back(token)
 
 
 @router.post("/waitlist")
