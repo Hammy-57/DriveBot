@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlmodel import select
 
+import ui
 import whatsapp as wa
 from bot_logic import TEMPLATE_SIDS, offer_next_waitlist, send_reminder_now
 from phones import normalize_phone as _normalize
@@ -30,6 +31,7 @@ load_dotenv()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 LOCAL_TZ = ZoneInfo("Europe/Rome")
+DASH = "\u2013"
 
 router = APIRouter(prefix="/admin")
 security = HTTPBasic()
@@ -44,36 +46,7 @@ def require_login(credentials: HTTPBasicCredentials = Depends(security)) -> str:
     return credentials.username
 
 
-PAGE_STYLE = """
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background:#17181c; color:#e8e9ec;
-         max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; line-height: 1.45; }
-  h1 { font-size: 1.3rem; margin: 0 0 4px; }
-  h2 { font-size: 1.05rem; margin: 32px 0 10px; border-bottom: 1px solid #35363c; padding-bottom: 6px; }
-  a { color: #f5c451; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  table { width: 100%; border-collapse: collapse; margin: 8px 0 18px; font-size: 0.92rem; }
-  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #2a2b30; }
-  th { color: #9a9ca3; font-weight: 500; font-size: 0.8rem; }
-  form.inline { display: inline; }
-  .card { background: #1e1f24; border: 1px solid #2a2b30; border-radius: 6px; padding: 16px 18px; margin: 14px 0; }
-  input, select { background:#111216; border:1px solid #3a3b41; color:#e8e9ec; padding:7px 9px; border-radius:5px; font-size:0.92rem; }
-  label { display:block; font-size:0.82rem; color:#9a9ca3; margin: 10px 0 3px; }
-  button { background:#f5c451; color:#17181c; border:none; padding:8px 16px; border-radius:5px;
-           font-weight:600; cursor:pointer; margin-top:12px; font-size:0.9rem; }
-  button.danger { background:#e05555; color:#fff; }
-  button.small { padding:4px 10px; font-size:0.8rem; margin-top:0; }
-  .status { font-size:0.78rem; padding:2px 8px; border-radius:10px; background:#2a2b30; }
-  .top-link { font-size: 0.85rem; }
-
-.stats{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
-.stat{background:#1e1f25;border:1px solid #2c2d34;border-radius:10px;padding:10px 16px;min-width:110px}
-.stat b{display:block;font-size:24px;color:#f5c542}
-.stat span{font-size:12px;color:#9a9ca3}
-details{margin:8px 0}summary{cursor:pointer;color:#9a9ca3;padding:6px 0}
-</style>
-"""
+PAGE_STYLE = ""  # kept for backwards compatibility; styling now lives in ui.py
 
 
 def _local(dt: datetime) -> str:
@@ -95,27 +68,29 @@ def _base_url(request: Request) -> str:
 
 
 def _yes(flag: bool) -> str:
-    return "<span style='color:#5fd38d'>yes</span>" if flag else "<span style='color:#ff6b6b'>NO</span>"
+    return ui.badge("yes", "b-ok") if flag else ui.badge("NO", "b-bad")
 
 
 def _status_box() -> str:
     info = wa.status_info()
     templates = "".join(
-        f"<li>{esc(kind)}: {_yes(bool(sid))}</li>" for kind, sid in TEMPLATE_SIDS.items()
+        f"<li><span>{esc(kind)}</span>{_yes(bool(sid))}</li>" for kind, sid in TEMPLATE_SIDS.items()
     )
     return f"""
     <div class="card">
-      <strong>System check</strong>
-      <ul style="line-height:1.7">
-        <li>Twilio credentials loaded: {_yes(info['credentials'])}</li>
-        <li>WhatsApp sender: <code>{esc(info['from_number'] or 'NOT SET')}</code></li>
-        <li>Sandbox demo mode (SANDBOX_FREEFORM): {_yes(info['freeform'])} (on = demo only, off = production)</li>
-        <li>Approved template IDs set:<ul>{templates}</ul></li>
+      <h3>System check</h3>
+      <ul class="checks">
+        <li><span>Twilio credentials loaded</span>{_yes(info['credentials'])}</li>
+        <li><span>WhatsApp sender</span><code>{esc(info['from_number'] or 'NOT SET')}</code></li>
+        <li><span>Sandbox demo mode <span class="hint">(SANDBOX_FREEFORM — on = demo only, off = production)</span></span>{_yes(info['freeform'])}</li>
       </ul>
-      <form method="post" action="/admin/test-message">
-        <label>Send a test WhatsApp message to (with country code)</label>
-        <input name="phone" placeholder="+39..." required>
-        <button type="submit">Send test</button>
+      <p class="hint" style="margin:14px 0 4px"><strong>Approved template IDs</strong></p>
+      <ul class="checks">{templates}</ul>
+      <form method="post" action="/admin/test-message" style="margin-top:18px">
+        <div class="form-grid">
+          {ui.field("Send a test WhatsApp message to", '<input name="phone" placeholder="+39..." required>', full=True, optional="(with country code)")}
+        </div>
+        <div class="form-actions"><button type="submit">Send test message</button></div>
       </form>
     </div>"""
 
@@ -123,8 +98,8 @@ def _status_box() -> str:
 def _last_error_banner() -> str:
     if not wa.last_error:
         return ""
-    return (f'<div class="card" style="border-color:#ff6b6b"><strong style="color:#ff6b6b">Last WhatsApp sending problem</strong>'
-            f'<p><code>{esc(wa.last_error)}</code></p></div>')
+    return (f'<div class="card danger"><h3 style="color:var(--bad)">Last WhatsApp sending problem</h3>'
+            f'<p style="margin:8px 0 0"><code>{esc(wa.last_error)}</code></p></div>')
 
 
 def stat_cards(items) -> str:
@@ -143,38 +118,47 @@ def split_lessons(lessons):
 
 
 def _button(action: str, label: str, danger: bool = True) -> str:
-    cls = "small danger" if danger else "small"
+    cls = "small danger" if danger else "small secondary"
     return (f'<form class="inline" method="post" action="{action}">'
             f'<button class="{cls}">{label}</button></form>')
 
 
 def _page(title: str, body: str) -> str:
-    return (f'<!DOCTYPE html><html><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>{esc(title)}</title>{PAGE_STYLE}</head><body>{body}</body></html>')
+    return ui.page(title, body, lang="en", context="Admin")
 
 
 def error_page(status: int, message: str, back: str = "/admin/", it: bool = False) -> str:
     if it:
-        title, back_label = "Qualcosa non ha funzionato", "← Indietro"
+        title, back_label = "Qualcosa non ha funzionato", "Indietro"
         if status >= 500:
             message = "Errore del server. Riprova tra poco; se continua, avvisa chi ti ha attivato il servizio."
     else:
-        title, back_label = "Something went wrong", "← Back"
+        title, back_label = "Something went wrong", "Back"
         if status >= 500:
             message = "Server error. The details were logged. Try again, and if it keeps happening check the Railway Deploy Logs."
-    return _page(title, f"""
-    <p class="top-link"><a href="{esc(back)}">{back_label}</a></p>
-    <h1 style="color:#ff6b6b">❌ {esc(title)}</h1>
-    <div class="card"><p>{esc(message)}</p><p style="color:#9a9ca3;font-size:13px">Error {status}</p></div>""")
+    body = f"""
+    <a class="crumb" href="{esc(back)}">{ui.ICON_BACK} {back_label}</a>
+    <div class="card" style="margin-top:14px"><div class="result err">
+      <div class="icon">{ui.ICON_ERR}</div>
+      <div><h1>{esc(title)}</h1><p>{esc(message)}</p><p class="hint">Error {status}</p></div>
+    </div></div>"""
+    if it:
+        return ui.page(title, body, lang="it", context="Area istruttore")
+    return _page(title, body)
 
 
 def _result_page(ok: bool, title: str, detail: str, back: str, back_label: str = "← Back") -> HTMLResponse:
-    color = "#5fd38d" if ok else "#ff6b6b"
-    return HTMLResponse(_page(title, f"""
-    <p class="top-link"><a href="{esc(back)}">{back_label}</a></p>
-    <h1 style="color:{color}">{'✅' if ok else '❌'} {esc(title)}</h1>
-    <div class="card"><p>{detail}</p></div>"""))
+    label = back_label.replace("←", "").strip()
+    it = label.lower() == "indietro"
+    body = f"""
+    <a class="crumb" href="{esc(back)}">{ui.ICON_BACK} {esc(label)}</a>
+    <div class="card" style="margin-top:14px"><div class="result {'ok' if ok else 'err'}">
+      <div class="icon">{ui.ICON_OK if ok else ui.ICON_ERR}</div>
+      <div><h1>{esc(title)}</h1><p>{detail}</p></div>
+    </div></div>"""
+    if it:
+        return HTMLResponse(ui.page(title, body, lang="it", context="Area istruttore"))
+    return HTMLResponse(_page(title, body))
 
 
 def apply_reminder_choice(lesson_id: int, choice: str, back: str, it: bool = False):
@@ -208,25 +192,27 @@ def dashboard(user: str = Depends(require_login)):
         instructors = s.exec(select(Instructor)).all()
 
     rows = "".join(
-        f"<tr><td>{esc(i.name)}</td><td>{esc(i.phone)}</td>"
-        f"<td><a href='/admin/instructor/{i.id}'>Open →</a></td></tr>"
+        f"<tr><td>{ui.person(i.name)}</td><td>{esc(i.phone)}</td>"
+        f"<td><div class='actions'><a class='btn small secondary' href='/admin/instructor/{i.id}' "
+        f"style='color:var(--text)'>Open</a></div></td></tr>"
         for i in instructors
-    ) or "<tr><td colspan='3'>No instructors yet. Add one below.</td></tr>"
+    )
 
-    return _page("DriveBot Admin", f"""
-    <h1>🚗 DriveBot Admin</h1>
-    <h2>Instructors</h2>
-    <table><tr><th>Name</th><th>Phone</th><th></th></tr>{rows}</table>
-    <div class="card">
-      <strong>Add instructor</strong>
-      <form method="post" action="/admin/instructors">
-        <label>Name</label><input name="name" required>
-        <label>WhatsApp phone (with country code)</label><input name="phone" placeholder="+39..." required>
-        <button type="submit">Add instructor</button>
-      </form>
-    </div>
-    {_last_error_banner()}
-    <h2>Setup</h2>{_status_box()}""")
+    add_form = ui.form_card(
+        "Add instructor", "/admin/instructors",
+        ui.field("Name", '<input name="name" required>')
+        + ui.field("WhatsApp phone", '<input name="phone" placeholder="+39..." required>', optional="(with country code)"),
+        "Add instructor",
+    )
+
+    body = (
+        ui.page_head("Instructors", "Manage driving instructors, their students and lesson reminders.")
+        + ui.section("All instructors", ui.table(["Name", "Phone", ""], rows, "No instructors yet. Add one below."), count=len(instructors))
+        + add_form
+        + _last_error_banner()
+        + ui.section("Setup", _status_box())
+    )
+    return _page("DriveBot Admin", body)
 
 
 @router.post("/instructors")
@@ -263,24 +249,30 @@ def instructor_page(instructor_id: int, request: Request, user: str = Depends(re
     name_of = {st.id: st.name for st in students}
 
     student_rows = "".join(
-        f"<tr><td>{esc(st.name)}</td><td>{esc(st.phone)}</td><td>{esc(st.language)}</td>"
-        f"<td><span class='status'>{'active' if st.active else 'inactive'}</span></td>"
-        f"<td>{_button(f'/admin/student/{st.id}/deactivate', 'Deactivate') if st.active else '-'}</td></tr>"
+        f"<tr><td>{ui.person(st.name)}</td><td>{esc(st.phone)}</td><td>{esc(st.language.upper())}</td>"
+        f"<td>{ui.badge('Active', 'b-ok') if st.active else ui.badge('Inactive')}</td>"
+        f"<td><div class='actions'>{_button(f'/admin/student/{st.id}/deactivate', 'Deactivate') if st.active else ''}</div></td></tr>"
         for st in students
-    ) or "<tr><td colspan='5'>No students yet.</td></tr>"
+    )
 
     def lesson_row(l):
-        return (f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td>"
-                f"<td>{_local(l.start_time)}</td><td>{esc(l.location or '-')}</td>"
-                f"<td><span class='status'>{esc(l.status)}</span></td>"
-                f"<td>{_button(f'/admin/lesson/{l.id}/resend', 'Send now', danger=False) + _button(f'/admin/lesson/{l.id}/remind-later', 'Send in 2 min', danger=False) if l.status in ('scheduled', 'confirmed') else ''} "
-                f"{_button(f'/admin/lesson/{l.id}/cancel', 'Cancel') if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-'}</td></tr>")
+        live = l.status in ("scheduled", "confirmed")
+        actions = ""
+        if live:
+            actions += _button(f"/admin/lesson/{l.id}/resend", "Send now", danger=False)
+            actions += _button(f"/admin/lesson/{l.id}/remind-later", "Send in 2 min", danger=False)
+        if l.status in ("scheduled", "confirmed", "reschedule_requested"):
+            actions += _button(f"/admin/lesson/{l.id}/cancel", "Cancel")
+        return (f"<tr><td>{ui.person(name_of.get(l.student_id, '?'))}</td>"
+                f"<td class='nowrap'>{_local(l.start_time)}</td><td>{esc(l.location or DASH)}</td>"
+                f"<td>{ui.badge(l.status.replace('_', ' ').capitalize(), l.status)}</td>"
+                f"<td><div class='actions'>{actions}</div></td></tr>")
 
     upcoming, past = split_lessons(lessons)
-    head = "<tr><th>Student</th><th>When (Rome time)</th><th>Location</th><th>Status</th><th></th></tr>"
-    upcoming_html = f"<table>{head}{''.join(lesson_row(l) for l in upcoming) or '<tr><td colspan=5>No upcoming lessons.</td></tr>'}</table>"
-    past_html = (f"<details><summary>Past and cancelled lessons ({len(past)})</summary><table>{head}"
-                 f"{''.join(lesson_row(l) for l in past)}</table></details>") if past else ""
+    heads = ["Student", "When (Rome time)", "Location", "Status", ""]
+    upcoming_html = ui.table(heads, "".join(lesson_row(l) for l in upcoming), "No upcoming lessons.")
+    past_html = (f"<details><summary>Past and cancelled lessons ({len(past)})</summary>"
+                 f"{ui.table(heads, ''.join(lesson_row(l) for l in past))}</details>") if past else ""
     cards = stat_cards([
         (len(upcoming), "upcoming lessons"),
         (sum(1 for l in upcoming if l.status == "confirmed"), "confirmed"),
@@ -290,71 +282,61 @@ def instructor_page(instructor_id: int, request: Request, user: str = Depends(re
     ])
 
     waitlist_rows = "".join(
-        f"<tr><td>{esc(name_of.get(w.student_id, '?'))}</td>"
-        f"<td>{'waiting' if not w.offered else 'offered a slot'}</td>"
-        f"<td>{_button(f'/admin/waitlist/{w.id}/remove', 'Remove')}</td></tr>"
+        f"<tr><td>{ui.person(name_of.get(w.student_id, '?'))}</td>"
+        f"<td>{ui.badge('Waiting', 'b-info') if not w.offered else ui.badge('Offered a slot', 'b-warn')}</td>"
+        f"<td><div class='actions'>{_button(f'/admin/waitlist/{w.id}/remove', 'Remove')}</div></td></tr>"
         for w in waitlist
-    ) or "<tr><td colspan='3'>Waitlist empty.</td></tr>"
+    )
 
     active_students = [st for st in students if st.active]
     student_options = "".join(f"<option value='{st.id}'>{esc(st.name)}</option>" for st in active_students)
-    no_students = "<option disabled>Add a student first</option>"
+    no_students = "<option disabled selected>Add a student first</option>"
+    student_select = f'<select name="student_id" required>{student_options or no_students}</select>'
 
-    return _page(f"{instructor.name} — DriveBot Admin", f"""
-    <p class="top-link"><a href="/admin">← All instructors</a></p>
-    <h1>{esc(instructor.name)}</h1>
-    <p style="color:#9a9ca3">{esc(instructor.phone)}</p>
+    link_card = f"""
     <div class="card">
-      <strong>Private page for this instructor</strong>
-      <p>Send him this link on WhatsApp. Anyone with the link can manage <em>only this instructor's</em> students and lessons.</p>
-      <input readonly value="{esc(portal_link)}" onclick="this.select()" style="width:100%">
-      {_button(f'/admin/instructor/{instructor_id}/reset-link', 'Reset link (old link stops working)')}
-    </div>
+      <h3>Private page for this instructor</h3>
+      <p class="hint" style="margin:0">Send this link on WhatsApp. Anyone with the link can manage <em>only this instructor's</em> students and lessons.</p>
+      <div class="copy-row">
+        <input id="portal-link" readonly value="{esc(portal_link)}" onclick="this.select()">
+        <button type="button" class="secondary" onclick="copyLink(this,'portal-link')">Copy</button>
+      </div>
+      <div class="form-actions">{_button(f'/admin/instructor/{instructor_id}/reset-link', 'Reset link (old link stops working)')}</div>
+    </div>"""
 
-    <h2>Students</h2>
-    <table><tr><th>Name</th><th>Phone</th><th>Lang</th><th>Status</th><th></th></tr>{student_rows}</table>
-    <div class="card">
-      <strong>Add student</strong>
-      <form method="post" action="/admin/instructor/{instructor_id}/students">
-        <label>Name</label><input name="name" required>
-        <label>Phone (with country code)</label><input name="phone" placeholder="+39..." required>
-        <label>Language</label>
-        <select name="language"><option value="it">Italian</option><option value="en">English</option></select>
-        <button type="submit">Add student</button>
-      </form>
-    </div>
+    student_form = ui.form_card(
+        "Add student", f"/admin/instructor/{instructor_id}/students",
+        ui.field("Name", '<input name="name" required>')
+        + ui.field("Phone", '<input name="phone" placeholder="+39..." required>', optional="(with country code)")
+        + ui.field("Language", '<select name="language"><option value="it">Italian</option><option value="en">English</option></select>'),
+        "Add student",
+    )
+    lesson_form = ui.form_card(
+        "Schedule lesson", f"/admin/instructor/{instructor_id}/lessons",
+        ui.field("Student", student_select)
+        + ui.field("Date & time", '<input type="datetime-local" name="when" required>', optional="(Rome local time)")
+        + ui.field("Location", '<input name="location" placeholder="Via Roma 25, Cassino">', optional="(optional)")
+        + ui.field("Reminder to the student",
+                   '<select name="reminder"><option value="auto">Automatic (24h and 2h before)</option>'
+                   '<option value="now">Send right now</option><option value="2min">Send in 2 minutes</option></select>'),
+        "Schedule lesson",
+    )
+    waitlist_form = ui.form_card(
+        "Add to waitlist", f"/admin/instructor/{instructor_id}/waitlist",
+        ui.field("Student", student_select, full=True),
+        "Add to waitlist",
+    )
 
-    <h2>Lessons</h2>
-    {cards}{upcoming_html}{past_html}
-    <div class="card">
-      <strong>Schedule lesson</strong>
-      <form method="post" action="/admin/instructor/{instructor_id}/lessons">
-        <label>Student</label>
-        <select name="student_id" required>{student_options or no_students}</select>
-        <label>Date &amp; time (Rome local time)</label>
-        <input type="datetime-local" name="when" required>
-        <label>Location (optional)</label>
-        <input name="location" placeholder="Via Roma 25, Cassino">
-        <label>Reminder to the student</label>
-        <select name="reminder">
-          <option value="auto">Automatic (24h and 2h before)</option>
-          <option value="now">Send right now</option>
-          <option value="2min">Send in 2 minutes</option>
-        </select>
-        <button type="submit">Schedule lesson</button>
-      </form>
-    </div>
-
-    <h2>Waitlist</h2>
-    <table><tr><th>Student</th><th>Status</th><th></th></tr>{waitlist_rows}</table>
-    <div class="card">
-      <strong>Add to waitlist</strong>
-      <form method="post" action="/admin/instructor/{instructor_id}/waitlist">
-        <label>Student</label>
-        <select name="student_id" required>{student_options or no_students}</select>
-        <button type="submit">Add to waitlist</button>
-      </form>
-    </div>""")
+    body = (
+        ui.page_head(esc(instructor.name), esc(instructor.phone), back=("/admin", "All instructors"))
+        + link_card
+        + ui.section("Lessons", cards + upcoming_html + past_html + lesson_form)
+        + ui.section("Students", ui.table(["Name", "Phone", "Lang", "Status", ""], student_rows, "No students yet."), count=len(students))
+        + student_form
+        + ui.section("Waitlist", ui.table(["Student", "Status", ""], waitlist_rows, "Waitlist empty."), count=len(waitlist))
+        + waitlist_form
+    )
+    return _page(f"{instructor.name} \u2014 DriveBot Admin", body)
 
 
 def _require_instructor(s, instructor_id: int) -> Instructor:
