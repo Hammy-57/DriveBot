@@ -20,6 +20,7 @@ from bot_logic import check_and_send_reminders, handle_incoming_message
 from db import get_session, init_db
 from scheduler import start_scheduler
 from admin import ADMIN_PASSWORD, error_page, require_login, router as admin_router
+from i18n import current_path, get_lang, router as i18n_router, set_lang
 from portal import router as portal_router
 
 load_dotenv()
@@ -27,6 +28,7 @@ load_dotenv()
 app = FastAPI(title="DriveBot")
 app.include_router(admin_router)
 app.include_router(portal_router)
+app.include_router(i18n_router)
 
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 # Set this to your real deployed URL once you're live, e.g.
@@ -49,22 +51,29 @@ def _back_for(request: Request) -> str:
     return "/admin/"
 
 
+def _lang(request: Request) -> str:
+    code = get_lang(request)
+    set_lang(code)
+    current_path.set(request.url.path)
+    return code
+
+
 @app.exception_handler(StarletteHTTPException)
 async def _http_error(request: Request, exc: StarletteHTTPException):
     # 401 must stay as-is so the browser shows its login box.
     if _is_ui(request) and exc.status_code != 401:
-        return HTMLResponse(error_page(exc.status_code, str(exc.detail), _back_for(request),
-                                       it=request.url.path.startswith("/i/")), status_code=exc.status_code)
+        lang = _lang(request)
+        return HTMLResponse(error_page(exc.status_code, str(exc.detail), _back_for(request), lang=lang),
+                            status_code=exc.status_code)
     return await http_exception_handler(request, exc)
 
 
 @app.exception_handler(RequestValidationError)
 async def _validation_error(request: Request, exc: RequestValidationError):
     if _is_ui(request):
-        msg = "Some fields are missing or invalid. Go back and check the form."
-        if request.url.path.startswith("/i/"):
-            msg = "Alcuni campi mancano o non sono validi. Torna indietro e controlla."
-        return HTMLResponse(error_page(422, msg, _back_for(request), it=request.url.path.startswith("/i/")), status_code=422)
+        from i18n import T
+        lang = _lang(request)
+        return HTMLResponse(error_page(422, T("err_fields"), _back_for(request), lang=lang), status_code=422)
     return await request_validation_exception_handler(request, exc)
 
 
@@ -72,7 +81,8 @@ async def _validation_error(request: Request, exc: RequestValidationError):
 async def _unhandled_error(request: Request, exc: Exception):
     log.exception("Unhandled error on %s", request.url.path)
     if _is_ui(request):
-        return HTMLResponse(error_page(500, "", _back_for(request), it=request.url.path.startswith("/i/")), status_code=500)
+        lang = _lang(request)
+        return HTMLResponse(error_page(500, "", _back_for(request), lang=lang), status_code=500)
     return Response("Internal Server Error", status_code=500)
 
 

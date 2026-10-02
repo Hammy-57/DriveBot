@@ -10,54 +10,33 @@ so the waitlist offer still goes out automatically.
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Form, HTTPException
+from fastapi import APIRouter, Depends, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlmodel import select
 
-import ui
-from admin import DASH, LOCAL_TZ, _button, _local, apply_reminder_choice, esc, normalize_phone, split_lessons, stat_cards
+from admin import (LOCAL_TZ, _button, _local, _page, _status_chip, apply_reminder_choice, esc, normalize_phone,
+                   split_lessons, stat_cards)
 from bot_logic import offer_next_waitlist
 from db import get_session
+from i18n import T, use_request_lang
 from models import Instructor, Lesson, Student, WaitlistEntry
 
-router = APIRouter(prefix="/i/{token}")
-
-STATUS_IT = {
-    "scheduled": "In programma",
-    "confirmed": "Confermata",
-    "cancelled": "Cancellata",
-    "reschedule_requested": "Vuole spostarla",
-    "no_show": "Assente",
-    "completed": "Completata",
-}
-
+router = APIRouter(prefix="/i/{token}", dependencies=[Depends(use_request_lang)])
 
 def _instructor(s, token: str) -> Instructor:
     inst = None
     if token and len(token) >= 16:
         inst = s.exec(select(Instructor).where(Instructor.access_token == token)).first()
     if inst is None:
-        raise HTTPException(status_code=404, detail="Pagina non trovata")
+        raise HTTPException(status_code=404, detail=T("err_not_found"))
     return inst
 
 
 def _own_student(s, inst: Instructor, student_id: int) -> Student:
     st = s.get(Student, student_id)
     if st is None or st.instructor_id != inst.id:
-        raise HTTPException(status_code=404, detail="Allievo non trovato")
+        raise HTTPException(status_code=404, detail=T("err_not_found"))
     return st
-
-
-def _phone(raw: str) -> str:
-    try:
-        return normalize_phone(raw)
-    except HTTPException:
-        raise HTTPException(status_code=400, detail="Numero non valido. Usa il formato +393331234567")
-
-
-def _page(title: str, body: str) -> str:
-    return ui.page(title, body, lang="it", context="Area istruttore",
-                   extra_head='<meta name="robots" content="noindex, nofollow"><meta name="referrer" content="no-referrer">')
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -72,76 +51,82 @@ def portal_home(token: str):
     name_of = {st.id: st.name for st in students}
 
     student_rows = "".join(
-        f"<tr><td>{ui.person(st.name)}</td><td>{esc(st.phone)}</td><td>{'IT' if st.language == 'it' else 'EN'}</td>"
-        f"<td><div class='actions'>{_button(f'{base}/student/{st.id}/deactivate', 'Rimuovi') if st.active else ui.badge('Rimosso')}</div></td></tr>"
+        f"<tr><td>{esc(st.name)}</td><td dir='ltr'>{esc(st.phone)}</td><td>{'IT' if st.language == 'it' else 'EN'}</td>"
+        f"<td>{_button(f'{base}/student/{st.id}/deactivate', esc(T('remove'))) if st.active else esc(T('inactive'))}</td></tr>"
         for st in students
-    )
+    ) or f"<tr><td colspan='4'>{esc(T('no_students'))}</td></tr>"
 
     def lesson_row(l):
-        can_cancel = l.status in ("scheduled", "confirmed", "reschedule_requested")
-        return (f"<tr><td>{ui.person(name_of.get(l.student_id, '?'))}</td><td class='nowrap'>{_local(l.start_time)}</td>"
-                f"<td>{esc(l.location or DASH)}</td><td>{ui.badge(STATUS_IT.get(l.status, l.status), l.status)}</td>"
-                f"<td><div class='actions'>{_button(f'{base}/lesson/{l.id}/cancel', 'Cancella') if can_cancel else ''}</div></td></tr>")
+        cancel = (_button(f'{base}/lesson/{l.id}/cancel', esc(T('cancel')))
+                  if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-')
+        return (f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td><td>{_local(l.start_time)}</td>"
+                f"<td>{esc(l.location or '-')}</td><td>{_status_chip(l.status)}</td><td>{cancel}</td></tr>")
 
     upcoming, past = split_lessons(lessons)
-    heads = ["Allievo", "Quando", "Luogo", "Stato", ""]
-    upcoming_html = ui.table(heads, "".join(lesson_row(l) for l in upcoming), "Nessuna lezione in programma.")
-    past_html = (f"<details><summary>Lezioni passate e cancellate ({len(past)})</summary>"
-                 f"{ui.table(heads, ''.join(lesson_row(l) for l in past))}</details>") if past else ""
+    head = (f"<tr><th>{esc(T('student'))}</th><th>{esc(T('when_rome'))}</th><th>{esc(T('location'))}</th>"
+            f"<th>{esc(T('status'))}</th><th></th></tr>")
+    upcoming_body = "".join(lesson_row(l) for l in upcoming) or f"<tr><td colspan=5>{esc(T('no_upcoming'))}</td></tr>"
+    upcoming_html = f"<table>{head}{upcoming_body}</table>"
+    past_html = (f"<details><summary>{esc(T('past_cancelled', n=len(past)))}</summary><table>{head}"
+                 f"{''.join(lesson_row(l) for l in past)}</table></details>") if past else ""
     cards = stat_cards([
-        (len(upcoming), "lezioni in programma"),
-        (sum(1 for l in upcoming if l.status == "confirmed"), "confermate"),
-        (sum(1 for l in upcoming if l.status == "scheduled"), "in attesa di risposta"),
-        (sum(1 for l in upcoming if l.status == "reschedule_requested"), "vogliono spostare"),
-        (sum(1 for st in students if st.active), "allievi attivi"),
+        (len(upcoming), T("stat_upcoming")),
+        (sum(1 for l in upcoming if l.status == "confirmed"), T("stat_confirmed")),
+        (sum(1 for l in upcoming if l.status == "scheduled"), T("stat_waiting")),
+        (sum(1 for l in upcoming if l.status == "reschedule_requested"), T("stat_resched")),
+        (sum(1 for st in students if st.active), T("stat_students")),
     ])
 
     waitlist_rows = "".join(
-        f"<tr><td>{ui.person(name_of.get(w.student_id, '?'))}</td>"
-        f"<td>{ui.badge('In attesa', 'b-info') if not w.offered else ui.badge('Slot proposto', 'b-warn')}</td>"
-        f"<td><div class='actions'>{_button(f'{base}/waitlist/{w.id}/remove', 'Togli')}</div></td></tr>"
+        f"<tr><td>{esc(name_of.get(w.student_id, '?'))}</td>"
+        f"<td>{esc(T('waiting') if not w.offered else T('offered_slot'))}</td>"
+        f"<td>{_button(f'{base}/waitlist/{w.id}/remove', esc(T('remove')))}</td></tr>"
         for w in waitlist
-    )
+    ) or f"<tr><td colspan='3'>{esc(T('waitlist_empty'))}</td></tr>"
 
     opts = "".join(f"<option value='{st.id}'>{esc(st.name)}</option>" for st in students if st.active)
-    no_opts = "<option disabled selected>Aggiungi prima un allievo</option>"
-    student_select = f'<select name="student_id" required>{opts or no_opts}</select>'
+    no_opts = f"<option disabled>{esc(T('add_student_first'))}</option>"
 
-    lesson_form = ui.form_card(
-        "Nuova lezione", f"{base}/lessons",
-        ui.field("Allievo", student_select)
-        + ui.field("Data e ora", '<input type="datetime-local" name="when" required>')
-        + ui.field("Luogo", '<input name="location" placeholder="Via Roma 25, Cassino">', optional="(facoltativo)")
-        + ui.field("Promemoria all'allievo",
-                   '<select name="reminder"><option value="auto">Automatico (24 ore e 2 ore prima)</option>'
-                   '<option value="now">Invia subito</option><option value="2min">Invia tra 2 minuti</option></select>'),
-        "Aggiungi lezione",
-    )
-    student_form = ui.form_card(
-        "Nuovo allievo", f"{base}/students",
-        ui.field("Nome", '<input name="name" required>')
-        + ui.field("Telefono WhatsApp", '<input name="phone" placeholder="+39..." required>', optional="(con prefisso, es. +39...)")
-        + ui.field("Lingua dei messaggi", '<select name="language"><option value="it">Italiano</option><option value="en">Inglese</option></select>', full=True),
-        "Aggiungi allievo",
-        hint="Avvisa l'allievo che riceverà messaggi WhatsApp di promemoria da questo numero.",
-    )
-    waitlist_form = ui.form_card(
-        "Aggiungi alla lista d'attesa", f"{base}/waitlist",
-        ui.field("Allievo", student_select, full=True),
-        "Aggiungi",
-    )
+    return _page(f"{inst.name} — DriveBot", f"""
+    <h1>🚗 {T('hello', name=esc(inst.name))}</h1>
+    <p style="color:var(--muted)">{esc(T('portal_intro'))}</p>
+    <p style="color:var(--muted);font-size:0.85rem">{esc(T('tip_whatsapp'))}</p>
 
-    body = (
-        ui.page_head(f"Ciao {esc(inst.name)}",
-                     "Gli allievi ricevono un promemoria su WhatsApp 24 ore e 2 ore prima della lezione e possono confermare o cancellare rispondendo. "
-                     "Se qualcuno cancella, lo slot viene proposto alla lista d'attesa. Le lezioni si leggono in ora italiana.")
-        + ui.section("Lezioni", cards + upcoming_html + past_html + lesson_form)
-        + ui.section("Allievi", ui.table(["Nome", "Telefono", "Lingua", ""], student_rows, "Nessun allievo."), count=len(students))
-        + student_form
-        + ui.section("Lista d'attesa", ui.table(["Allievo", "Stato", ""], waitlist_rows, "Lista d'attesa vuota."), count=len(waitlist))
-        + waitlist_form
-    )
-    return _page(f"{inst.name} \u2014 DriveBot", body)
+    <h2>{esc(T('lessons'))}</h2>
+    {cards}{upcoming_html}{past_html}
+    <div class="card"><strong>{esc(T('new_lesson'))}</strong>
+      <form method="post" action="{base}/lessons">
+        <label>{esc(T('student'))}</label><select name="student_id" required>{opts or no_opts}</select>
+        <label>{esc(T('date_time'))}</label><input type="datetime-local" name="when" required>
+        <label>{esc(T('location_opt'))}</label><input name="location" placeholder="Via Roma 25, Cassino">
+        <label>{esc(T('reminder_to'))}</label>
+        <select name="reminder">
+          <option value="auto">{esc(T('rem_auto'))}</option>
+          <option value="now">{esc(T('rem_now'))}</option>
+          <option value="2min">{esc(T('rem_2min'))}</option>
+        </select>
+        <button type="submit">{esc(T('schedule_lesson'))}</button>
+      </form></div>
+
+    <h2>{esc(T('students'))}</h2>
+    <table><tr><th>{esc(T('name'))}</th><th>{esc(T('phone'))}</th><th>{esc(T('language'))}</th><th></th></tr>{student_rows}</table>
+    <div class="card"><strong>{esc(T('new_student'))}</strong>
+      <form method="post" action="{base}/students">
+        <label>{esc(T('name'))}</label><input name="name" required>
+        <label>{esc(T('wa_phone_cc'))}</label><input name="phone" placeholder="+39..." dir="ltr" required>
+        <label>{esc(T('message_language'))}</label>
+        <select name="language"><option value="it">{esc(T('lang_it'))}</option><option value="en">{esc(T('lang_en'))}</option></select>
+        <button type="submit">{esc(T('add_student'))}</button>
+      </form>
+      <p style="color:var(--muted);font-size:13px">{esc(T('consent_note'))}</p></div>
+
+    <h2>{esc(T('waitlist'))}</h2>
+    <table><tr><th>{esc(T('student'))}</th><th>{esc(T('status'))}</th><th></th></tr>{waitlist_rows}</table>
+    <div class="card"><strong>{esc(T('add_to_waitlist'))}</strong>
+      <form method="post" action="{base}/waitlist">
+        <label>{esc(T('student'))}</label><select name="student_id" required>{opts or no_opts}</select>
+        <button type="submit">{esc(T('add'))}</button>
+      </form></div>""")
 
 
 def _back(token: str) -> RedirectResponse:
@@ -150,11 +135,11 @@ def _back(token: str) -> RedirectResponse:
 
 @router.post("/students")
 def add_student(token: str, name: str = Form(...), phone: str = Form(...), language: str = Form("it")):
-    phone = _phone(phone)
+    phone = normalize_phone(phone)
     with get_session() as s:
         inst = _instructor(s, token)
         if s.exec(select(Student).where(Student.phone == phone)).first() is not None:
-            raise HTTPException(status_code=400, detail="Questo numero è già registrato.")
+            raise HTTPException(status_code=400, detail=T("err_phone_dup"))
         s.add(Student(name=name.strip(), phone=phone, instructor_id=inst.id,
                       language=language if language in ("it", "en") else "it"))
         s.commit()
@@ -172,10 +157,10 @@ def add_lesson(token: str, student_id: int = Form(...), when: str = Form(...), l
         except ValueError:
             continue
     if local_dt is None:
-        raise HTTPException(status_code=400, detail="Data o ora non valida.")
+        raise HTTPException(status_code=400, detail=T("err_bad_datetime"))
     utc_dt = local_dt.astimezone(timezone.utc)
     if utc_dt <= datetime.now(timezone.utc):
-        raise HTTPException(status_code=400, detail="La data è nel passato.")
+        raise HTTPException(status_code=400, detail=T("err_past"))
     with get_session() as s:
         inst = _instructor(s, token)
         _own_student(s, inst, student_id)
@@ -184,7 +169,7 @@ def add_lesson(token: str, student_id: int = Form(...), when: str = Form(...), l
         s.commit()
         s.refresh(lesson)
         lesson_id = lesson.id
-    return apply_reminder_choice(lesson_id, reminder, f"/i/{token}/", it=True) or _back(token)
+    return apply_reminder_choice(lesson_id, reminder, f"/i/{token}/") or _back(token)
 
 
 @router.post("/waitlist")
@@ -205,7 +190,7 @@ def remove_waitlist(token: str, entry_id: int):
         inst = _instructor(s, token)
         entry = s.get(WaitlistEntry, entry_id)
         if entry is None or entry.instructor_id != inst.id:
-            raise HTTPException(status_code=404, detail="Non trovato")
+            raise HTTPException(status_code=404, detail=T("err_not_found"))
         s.delete(entry)
         s.commit()
     return _back(token)
@@ -217,7 +202,7 @@ def cancel_lesson(token: str, lesson_id: int):
         inst = _instructor(s, token)
         lesson = s.get(Lesson, lesson_id)
         if lesson is None or lesson.instructor_id != inst.id:
-            raise HTTPException(status_code=404, detail="Lezione non trovata")
+            raise HTTPException(status_code=404, detail=T("err_not_found"))
         lesson.status = "cancelled"
         lesson.awaiting_reply = False
         s.add(lesson)
