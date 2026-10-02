@@ -14,8 +14,8 @@ from fastapi import APIRouter, Depends, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlmodel import select
 
-from admin import (LOCAL_TZ, _button, _local, _page, _status_chip, apply_reminder_choice, esc, normalize_phone,
-                   split_lessons, stat_cards)
+import ui
+from admin import LOCAL_TZ, _local, apply_reminder_choice, esc, normalize_phone, split_lessons
 from bot_logic import offer_next_waitlist
 from db import get_session
 from i18n import T, use_request_lang
@@ -50,83 +50,74 @@ def portal_home(token: str):
     base = f"/i/{token}"
     name_of = {st.id: st.name for st in students}
 
-    student_rows = "".join(
-        f"<tr><td>{esc(st.name)}</td><td dir='ltr'>{esc(st.phone)}</td><td>{'IT' if st.language == 'it' else 'EN'}</td>"
-        f"<td>{_button(f'{base}/student/{st.id}/deactivate', esc(T('remove'))) if st.active else esc(T('inactive'))}</td></tr>"
-        for st in students
-    ) or f"<tr><td colspan='4'>{esc(T('no_students'))}</td></tr>"
+    # ---- lessons
+    lesson_heads = [T("student"), T("when_rome"), T("location"), T("status")]
 
     def lesson_row(l):
-        cancel = (_button(f'{base}/lesson/{l.id}/cancel', esc(T('cancel')))
-                  if l.status in ('scheduled', 'confirmed', 'reschedule_requested') else '-')
-        return (f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td><td>{_local(l.start_time)}</td>"
-                f"<td>{esc(l.location or '-')}</td><td>{_status_chip(l.status)}</td><td>{cancel}</td></tr>")
+        cancel = (ui.button_form(f"{base}/lesson/{l.id}/cancel", T("cancel"))
+                  if l.status in ("scheduled", "confirmed", "reschedule_requested") else "")
+        return ui.tr(lesson_heads, [esc(name_of.get(l.student_id, "?")), f"<span class='num'>{_local(l.start_time)}</span>",
+                                    esc(l.location or "–"), ui.badge(l.status)], actions=cancel, wrap=(2,))
 
     upcoming, past = split_lessons(lessons)
-    head = (f"<tr><th>{esc(T('student'))}</th><th>{esc(T('when_rome'))}</th><th>{esc(T('location'))}</th>"
-            f"<th>{esc(T('status'))}</th><th></th></tr>")
-    upcoming_body = "".join(lesson_row(l) for l in upcoming) or f"<tr><td colspan=5>{esc(T('no_upcoming'))}</td></tr>"
-    upcoming_html = f"<table>{head}{upcoming_body}</table>"
-    past_html = (f"<details><summary>{esc(T('past_cancelled', n=len(past)))}</summary><table>{head}"
-                 f"{''.join(lesson_row(l) for l in past)}</table></details>") if past else ""
-    cards = stat_cards([
+    upcoming_html = ui.table(lesson_heads, [lesson_row(l) for l in upcoming], T("no_upcoming"))
+    past_html = ui.history(T("past_cancelled", n=len(past)), ui.table(lesson_heads, [lesson_row(l) for l in past])) if past else ""
+    cards = ui.kpis([
         (len(upcoming), T("stat_upcoming")),
         (sum(1 for l in upcoming if l.status == "confirmed"), T("stat_confirmed")),
         (sum(1 for l in upcoming if l.status == "scheduled"), T("stat_waiting")),
         (sum(1 for l in upcoming if l.status == "reschedule_requested"), T("stat_resched")),
         (sum(1 for st in students if st.active), T("stat_students")),
-    ])
+    ], i=1)
 
-    waitlist_rows = "".join(
-        f"<tr><td>{esc(name_of.get(w.student_id, '?'))}</td>"
-        f"<td>{esc(T('waiting') if not w.offered else T('offered_slot'))}</td>"
-        f"<td>{_button(f'{base}/waitlist/{w.id}/remove', esc(T('remove')))}</td></tr>"
+    active_students = [st for st in students if st.active]
+    opts = "".join(f"<option value='{st.id}'>{esc(st.name)}</option>" for st in active_students)
+    pick = opts or f"<option disabled>{esc(T('add_student_first'))}</option>"
+
+    lesson_form = ui.form(
+        f"{base}/lessons",
+        ui.select_field(T("student"), "student_id", pick)
+        + ui.field(T("date_time"), "when", type="datetime-local")
+        + ui.field(T("location_opt"), "location", placeholder="Via Roma 25, Cassino", required=False)
+        + ui.select_field(T("reminder_to"), "reminder",
+                          f'<option value="auto">{esc(T("rem_auto"))}</option><option value="now">{esc(T("rem_now"))}</option>'
+                          f'<option value="2min">{esc(T("rem_2min"))}</option>'),
+        T("schedule_lesson"))
+
+    # ---- students
+    stu_heads = [T("name"), T("phone"), T("language")]
+    student_rows = [
+        ui.tr(stu_heads, [esc(st.name), f"<span class='mono' dir='ltr'>{esc(st.phone)}</span>", "IT" if st.language == "it" else "EN"],
+              actions=ui.button_form(f"{base}/student/{st.id}/deactivate", T("remove")))
+        for st in active_students
+    ]
+    student_form = ui.form(
+        f"{base}/students",
+        ui.field(T("name"), "name") + ui.field(T("wa_phone_cc"), "phone", placeholder="+39...", ltr=True)
+        + ui.select_field(T("message_language"), "language",
+                          f'<option value="it">{esc(T("lang_it"))}</option><option value="en">{esc(T("lang_en"))}</option>')
+        + f'<p class="hint full" style="grid-column:1/-1;margin:0">{esc(T("consent_note"))}</p>',
+        T("add_student"))
+
+    # ---- waitlist
+    wl_heads = [T("student"), T("status")]
+    wl_rows = [
+        ui.tr(wl_heads, [esc(name_of.get(w.student_id, "?")),
+                         f"<span class='badge {'info' if w.offered else ''}'>{esc(T('offered_slot') if w.offered else T('waiting'))}</span>"],
+              actions=ui.button_form(f"{base}/waitlist/{w.id}/remove", T("remove")))
         for w in waitlist
-    ) or f"<tr><td colspan='3'>{esc(T('waitlist_empty'))}</td></tr>"
+    ]
+    wl_form = ui.form(f"{base}/waitlist", ui.select_field(T("student"), "student_id", pick), T("add_to_waitlist"))
 
-    opts = "".join(f"<option value='{st.id}'>{esc(st.name)}</option>" for st in students if st.active)
-    no_opts = f"<option disabled>{esc(T('add_student_first'))}</option>"
-
-    return _page(f"{inst.name} — DriveBot", f"""
-    <h1>🚗 {T('hello', name=esc(inst.name))}</h1>
-    <p style="color:var(--muted)">{esc(T('portal_intro'))}</p>
-    <p style="color:var(--muted);font-size:0.85rem">{esc(T('tip_whatsapp'))}</p>
-
-    <h2>{esc(T('lessons'))}</h2>
-    {cards}{upcoming_html}{past_html}
-    <div class="card"><strong>{esc(T('new_lesson'))}</strong>
-      <form method="post" action="{base}/lessons">
-        <label>{esc(T('student'))}</label><select name="student_id" required>{opts or no_opts}</select>
-        <label>{esc(T('date_time'))}</label><input type="datetime-local" name="when" required>
-        <label>{esc(T('location_opt'))}</label><input name="location" placeholder="Via Roma 25, Cassino">
-        <label>{esc(T('reminder_to'))}</label>
-        <select name="reminder">
-          <option value="auto">{esc(T('rem_auto'))}</option>
-          <option value="now">{esc(T('rem_now'))}</option>
-          <option value="2min">{esc(T('rem_2min'))}</option>
-        </select>
-        <button type="submit">{esc(T('schedule_lesson'))}</button>
-      </form></div>
-
-    <h2>{esc(T('students'))}</h2>
-    <table><tr><th>{esc(T('name'))}</th><th>{esc(T('phone'))}</th><th>{esc(T('language'))}</th><th></th></tr>{student_rows}</table>
-    <div class="card"><strong>{esc(T('new_student'))}</strong>
-      <form method="post" action="{base}/students">
-        <label>{esc(T('name'))}</label><input name="name" required>
-        <label>{esc(T('wa_phone_cc'))}</label><input name="phone" placeholder="+39..." dir="ltr" required>
-        <label>{esc(T('message_language'))}</label>
-        <select name="language"><option value="it">{esc(T('lang_it'))}</option><option value="en">{esc(T('lang_en'))}</option></select>
-        <button type="submit">{esc(T('add_student'))}</button>
-      </form>
-      <p style="color:var(--muted);font-size:13px">{esc(T('consent_note'))}</p></div>
-
-    <h2>{esc(T('waitlist'))}</h2>
-    <table><tr><th>{esc(T('student'))}</th><th>{esc(T('status'))}</th><th></th></tr>{waitlist_rows}</table>
-    <div class="card"><strong>{esc(T('add_to_waitlist'))}</strong>
-      <form method="post" action="{base}/waitlist">
-        <label>{esc(T('student'))}</label><select name="student_id" required>{opts or no_opts}</select>
-        <button type="submit">{esc(T('add'))}</button>
-      </form></div>""")
+    body = (ui.header(T("hello", name=esc(inst.name)), sub=T("portal_intro"),
+                      extra_html=f'<p class="note">{esc(T("tip_whatsapp"))}</p>')
+            + cards
+            + ui.section(T("lessons"), upcoming_html + past_html + ui.panel(T("schedule_lesson"), lesson_form), count=len(upcoming), i=2)
+            + ui.section(T("students"), ui.table(stu_heads, student_rows, T("no_students")) + ui.panel(T("add_student"), student_form),
+                         count=len(active_students), i=3)
+            + ui.section(T("waitlist"), ui.table(wl_heads, wl_rows, T("waitlist_empty")) + ui.panel(T("add_to_waitlist"), wl_form),
+                         count=len(waitlist), i=4))
+    return ui.page(f"{inst.name} — DriveBot", body, home=f"{base}/")
 
 
 def _back(token: str) -> RedirectResponse:

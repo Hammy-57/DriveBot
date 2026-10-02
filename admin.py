@@ -20,7 +20,8 @@ from sqlmodel import select
 
 import whatsapp as wa
 from bot_logic import TEMPLATE_SIDS, offer_next_waitlist, send_reminder_now
-from i18n import LANGS, RTL, T, current, current_path, set_lang, use_request_lang
+import ui
+from i18n import T, set_lang, use_request_lang
 from phones import normalize_phone as _normalize
 from scheduler import schedule_reminder
 from db import get_session
@@ -45,46 +46,6 @@ def require_login(credentials: HTTPBasicCredentials = Depends(security)) -> str:
     return credentials.username
 
 
-PAGE_STYLE = """
-<style>
-  :root { --bg:#17181c; --text:#e8e9ec; --line:#2a2b30; --h2line:#35363c; --accent:#f5c451; --muted:#9a9ca3;
-          --card:#1e1f24; --inbg:#111216; --inline:#3a3b41; --chip:#2a2b30; --statbg:#1e1f25; --statline:#2c2d34;
-          --stat:#f5c542; color-scheme: dark; }
-  :root[data-theme="light"] { --bg:#f6f6f8; --text:#1c1d21; --line:#e3e4e9; --h2line:#d9dae0; --accent:#a86f00;
-          --muted:#6b6e78; --card:#ffffff; --inbg:#ffffff; --inline:#c9cad2; --chip:#ececf0; --statbg:#ffffff;
-          --statline:#e0e1e6; --stat:#a86f00; color-scheme: light; }
-  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text);
-         max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; line-height: 1.45; }
-  h1 { font-size: 1.3rem; margin: 0 0 4px; }
-  h2 { font-size: 1.05rem; margin: 32px 0 10px; border-bottom: 1px solid var(--h2line); padding-bottom: 6px; }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  table { width: 100%; border-collapse: collapse; margin: 8px 0 18px; font-size: 0.92rem; }
-  th, td { text-align: start; padding: 7px 8px; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
-  form.inline { display: inline; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 16px 18px; margin: 14px 0; }
-  input, select { background:var(--inbg); border:1px solid var(--inline); color:var(--text); padding:7px 9px; border-radius:5px; font-size:0.92rem; }
-  label { display:block; font-size:0.82rem; color:var(--muted); margin: 10px 0 3px; }
-  button { background:#f5c451; color:#17181c; border:none; padding:8px 16px; border-radius:5px;
-           font-weight:600; cursor:pointer; margin-top:12px; font-size:0.9rem; }
-  button.danger { background:#e05555; color:#fff; }
-  button.small { padding:4px 10px; font-size:0.8rem; margin-top:0; }
-  .status { font-size:0.78rem; padding:2px 8px; border-radius:10px; background:var(--chip); }
-  .top-link { font-size: 0.85rem; }
-  .ctlbar { display:flex; gap:8px; justify-content:flex-end; align-items:center; margin-bottom:14px; }
-  .ctlbar form { margin:0; }
-  .ctlbar select { padding:4px 8px; font-size:0.82rem; }
-  button.ctl { background:var(--chip); color:var(--text); border:1px solid var(--inline); margin-top:0; padding:3px 9px; font-size:0.95rem; font-weight:500; }
-  .stats{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
-  .stat{background:var(--statbg);border:1px solid var(--statline);border-radius:10px;padding:10px 16px;min-width:110px}
-  .stat b{display:block;font-size:24px;color:var(--stat)}
-  .stat span{font-size:12px;color:var(--muted)}
-  details{margin:8px 0}summary{cursor:pointer;color:var(--muted);padding:6px 0}
-</style>
-"""
-
-
 def _local(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -103,41 +64,28 @@ def _base_url(request: Request) -> str:
     return env or str(request.base_url).rstrip("/")
 
 
-def _yes(flag: bool) -> str:
-    if flag:
-        return f"<span style='color:#5fd38d'>{esc(T('yes'))}</span>"
-    return f"<span style='color:#ff6b6b'>{esc(T('no'))}</span>"
-
-
 def _status_box() -> str:
     info = wa.status_info()
-    templates = "".join(f"<li>{esc(kind)}: {_yes(bool(sid))}</li>" for kind, sid in TEMPLATE_SIDS.items())
-    return f"""
-    <div class="card">
-      <strong>{esc(T('system_check'))}</strong>
-      <ul style="line-height:1.7">
-        <li>{esc(T('twilio_loaded'))}: {_yes(info['credentials'])}</li>
-        <li>{esc(T('wa_sender'))}: <code>{esc(info['from_number'] or 'NOT SET')}</code></li>
-        <li>{esc(T('sandbox_mode'))} (SANDBOX_FREEFORM): {_yes(info['freeform'])} ({esc(T('sandbox_hint'))})</li>
-        <li>{esc(T('templates_set'))}:<ul>{templates}</ul></li>
-      </ul>
-      <form method="post" action="/admin/test-message">
-        <label>{esc(T('send_test_label'))}</label>
-        <input name="phone" placeholder="+39..." dir="ltr" required>
-        <button type="submit">{esc(T('send_test'))}</button>
-      </form>
-    </div>"""
+    rows = [
+        ui.check_row(T("twilio_loaded"), ui.state(info["credentials"])),
+        ui.check_row(T("wa_sender"), f"<code>{esc(info['from_number'] or T('not_set'))}</code>"),
+        ui.check_row(f"{T('sandbox_mode')} (SANDBOX_FREEFORM)", ui.state(info["freeform"]), hint=T("sandbox_hint")),
+    ]
+    rows += [ui.check_row(f"{T('templates_set')}: {kind}", ui.state(bool(sid))) for kind, sid in TEMPLATE_SIDS.items()]
+    test = f"""<div class="test-form"><form method="post" action="/admin/test-message">
+      <div class="form-grid">{ui.field(T('send_test_label'), 'phone', placeholder='+39...', full=True, ltr=True)}</div>
+      <div class="form-actions"><button type="submit" class="btn btn-primary">{esc(T('send_test'))}</button></div></form></div>"""
+    return f'<div class="card"><div class="checks">{"".join(rows)}</div>{test}</div>'
 
 
 def _last_error_banner() -> str:
     if not wa.last_error:
         return ""
-    return (f'<div class="card" style="border-color:#ff6b6b"><strong style="color:#ff6b6b">{esc(T("last_problem"))}</strong>'
-            f'<p><code>{esc(wa.last_error)}</code></p></div>')
+    return ui.alert(T("last_problem"), f"<code>{esc(wa.last_error)}</code>")
 
 
 def stat_cards(items) -> str:
-    return '<div class="stats">' + "".join(f'<div class="stat"><b>{v}</b><span>{esc(lbl)}</span></div>' for v, lbl in items) + "</div>"
+    return ui.kpis(items)
 
 
 def split_lessons(lessons):
@@ -151,48 +99,8 @@ def split_lessons(lessons):
     return upcoming, past
 
 
-def _button(action: str, label: str, danger: bool = True) -> str:
-    cls = "small danger" if danger else "small"
-    return (f'<form class="inline" method="post" action="{action}">'
-            f'<button class="{cls}">{label}</button></form>')
-
-
-def _status_chip(status: str) -> str:
-    return f"<span class='status'>{esc(T('status_' + status))}</span>"
-
-
-_THEME_HEAD_JS = 'try{var t=localStorage.getItem("theme");if(t)document.documentElement.setAttribute("data-theme",t)}catch(e){}'
-_THEME_JS = (
-    'function themeIcon(){var b=document.getElementById("themeBtn");'
-    'if(b)b.textContent=document.documentElement.getAttribute("data-theme")==="light"?"\\u{1F319}":"\\u2600\\uFE0F"}'
-    'function toggleTheme(){var r=document.documentElement,n=r.getAttribute("data-theme")==="light"?"dark":"light";'
-    'r.setAttribute("data-theme",n);try{localStorage.setItem("theme",n)}catch(e){}themeIcon()}'
-    'themeIcon();'
-)
-
-
-def _controls() -> str:
-    lang, path = current.get(), current_path.get()
-    options = "".join(
-        f'<option value="{code}"{" selected" if code == lang else ""}>{esc(name)}</option>' for code, name in LANGS.items()
-    )
-    label = esc(T("language"))
-    theme = esc(T("theme"))
-    return (f'<div class="ctlbar"><form method="get" action="/set-lang">'
-            f'<input type="hidden" name="next" value="{esc(path)}">'
-            f'<select name="lang" title="{label}" aria-label="{label}" onchange="this.form.submit()">{options}</select>'
-            f'<noscript><button class="small" type="submit">OK</button></noscript></form>'
-            f'<button type="button" class="ctl" id="themeBtn" onclick="toggleTheme()" title="{theme}" aria-label="{theme}"></button></div>')
-
-
-def _page(title: str, body: str) -> str:
-    lang = current.get()
-    direction = "rtl" if lang in RTL else "ltr"
-    return (f'<!DOCTYPE html><html lang="{lang}" dir="{direction}"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<meta name="robots" content="noindex, nofollow"><meta name="referrer" content="no-referrer">'
-            f'<title>{esc(title)}</title><script>{_THEME_HEAD_JS}</script>{PAGE_STYLE}</head>'
-            f'<body>{_controls()}{body}<script>{_THEME_JS}</script></body></html>')
+def _page(title: str, body: str, home: str = "/admin/") -> str:
+    return ui.page(title, body, home)
 
 
 def error_page(status: int, message: str, back: str = "/admin/", lang: str | None = None) -> str:
@@ -200,18 +108,12 @@ def error_page(status: int, message: str, back: str = "/admin/", lang: str | Non
         set_lang(lang)
     if status >= 500:
         message = T("err_server")
-    return _page(T("err_title"), f"""
-    <p class="top-link"><a href="{esc(back)}">{esc(T('back'))}</a></p>
-    <h1 style="color:#ff6b6b">❌ {esc(T('err_title'))}</h1>
-    <div class="card"><p>{esc(message)}</p><p style="color:var(--muted);font-size:13px">{esc(T('err_code', n=status))}</p></div>""")
+    return ui.page(T("err_title"), ui.result_view(False, T("err_title"), esc(message), back, T("back"),
+                                                  code_line=T("err_code", n=status)), home=back)
 
 
 def _result_page(ok: bool, title: str, detail: str, back: str, back_label: str | None = None) -> HTMLResponse:
-    color = "#5fd38d" if ok else "#ff6b6b"
-    return HTMLResponse(_page(title, f"""
-    <p class="top-link"><a href="{esc(back)}">{esc(back_label or T('back'))}</a></p>
-    <h1 style="color:{color}">{'✅' if ok else '❌'} {esc(title)}</h1>
-    <div class="card"><p>{detail}</p></div>"""))
+    return HTMLResponse(ui.page(title, ui.result_view(ok, title, detail, back, back_label or T("back"))))
 
 
 def apply_reminder_choice(lesson_id: int, choice: str, back: str, admin_hint: bool = False):
@@ -240,26 +142,21 @@ def dashboard(user: str = Depends(require_login)):
     with get_session() as s:
         instructors = s.exec(select(Instructor)).all()
 
-    rows = "".join(
-        f"<tr><td>{esc(i.name)}</td><td dir='ltr'>{esc(i.phone)}</td>"
-        f"<td><a href='/admin/instructor/{i.id}'>{esc(T('open'))} →</a></td></tr>"
-        for i in instructors
-    ) or f"<tr><td colspan='3'>{esc(T('no_instructors'))}</td></tr>"
+    heads = [T("name"), T("phone")]
+    rows = [ui.tr(heads, [f"<a href='/admin/instructor/{i.id}'><strong>{esc(i.name)}</strong></a>",
+                          f"<span class='mono' dir='ltr'>{esc(i.phone)}</span>"],
+                  actions=f"<a class='btn btn-sm' href='/admin/instructor/{i.id}'>{esc(T('open'))}</a>")
+            for i in instructors]
 
-    return _page(T("admin_title"), f"""
-    <h1>🚗 {esc(T('admin_title'))}</h1>
-    <h2>{esc(T('instructors'))}</h2>
-    <table><tr><th>{esc(T('name'))}</th><th>{esc(T('phone'))}</th><th></th></tr>{rows}</table>
-    <div class="card">
-      <strong>{esc(T('add_instructor'))}</strong>
-      <form method="post" action="/admin/instructors">
-        <label>{esc(T('name'))}</label><input name="name" required>
-        <label>{esc(T('wa_phone_cc'))}</label><input name="phone" placeholder="+39..." dir="ltr" required>
-        <button type="submit">{esc(T('add_instructor'))}</button>
-      </form>
-    </div>
-    {_last_error_banner()}
-    <h2>{esc(T('setup'))}</h2>{_status_box()}""")
+    add_form = ui.form("/admin/instructors",
+                       ui.field(T("name"), "name") + ui.field(T("wa_phone_cc"), "phone", placeholder="+39...", ltr=True),
+                       T("add_instructor"))
+    body = (ui.header(esc(T("admin_title")), sub=T("admin_sub"))
+            + ui.section(T("instructors"), ui.table(heads, rows, T("no_instructors")) + ui.panel(T("add_instructor"), add_form),
+                         count=len(instructors), i=1)
+            + _last_error_banner()
+            + ui.section(T("system_check"), _status_box(), i=2))
+    return ui.page(T("admin_title"), body)
 
 
 @router.post("/instructors")
@@ -295,31 +192,23 @@ def instructor_page(instructor_id: int, request: Request, user: str = Depends(re
 
     name_of = {st.id: st.name for st in students}
 
-    student_rows = "".join(
-        f"<tr><td>{esc(st.name)}</td><td dir='ltr'>{esc(st.phone)}</td><td>{esc(st.language)}</td>"
-        f"<td><span class='status'>{esc(T('active') if st.active else T('inactive'))}</span></td>"
-        f"<td>{_button(f'/admin/student/{st.id}/deactivate', esc(T('deactivate'))) if st.active else '-'}</td></tr>"
-        for st in students
-    ) or f"<tr><td colspan='5'>{esc(T('no_students'))}</td></tr>"
+    # ---- lessons
+    lesson_heads = [T("student"), T("when_rome"), T("location"), T("status")]
 
     def lesson_row(l):
-        live = l.status in ("scheduled", "confirmed")
-        send_buttons = (_button(f'/admin/lesson/{l.id}/resend', esc(T('send_now')), danger=False)
-                        + _button(f'/admin/lesson/{l.id}/remind-later', esc(T('send_in_2')), danger=False)) if live else ""
-        cancel_button = (_button(f'/admin/lesson/{l.id}/cancel', esc(T('cancel')))
-                         if l.status in ("scheduled", "confirmed", "reschedule_requested") else "-")
-        return (f"<tr><td>{esc(name_of.get(l.student_id, '?'))}</td>"
-                f"<td>{_local(l.start_time)}</td><td>{esc(l.location or '-')}</td>"
-                f"<td>{_status_chip(l.status)}</td><td>{send_buttons} {cancel_button}</td></tr>")
+        buttons = ""
+        if l.status in ("scheduled", "confirmed"):
+            buttons += (ui.button_form(f"/admin/lesson/{l.id}/resend", T("send_now"), "ghost", confirm=False)
+                        + ui.button_form(f"/admin/lesson/{l.id}/remind-later", T("send_in_2"), "ghost", confirm=False))
+        if l.status in ("scheduled", "confirmed", "reschedule_requested"):
+            buttons += ui.button_form(f"/admin/lesson/{l.id}/cancel", T("cancel"))
+        return ui.tr(lesson_heads, [esc(name_of.get(l.student_id, "?")), f"<span class='num'>{_local(l.start_time)}</span>",
+                                    esc(l.location or "–"), ui.badge(l.status)], actions=buttons, wrap=(2,))
 
     upcoming, past = split_lessons(lessons)
-    head = (f"<tr><th>{esc(T('student'))}</th><th>{esc(T('when_rome'))}</th><th>{esc(T('location'))}</th>"
-            f"<th>{esc(T('status'))}</th><th></th></tr>")
-    upcoming_body = "".join(lesson_row(l) for l in upcoming) or f"<tr><td colspan=5>{esc(T('no_upcoming'))}</td></tr>"
-    upcoming_html = f"<table>{head}{upcoming_body}</table>"
-    past_html = (f"<details><summary>{esc(T('past_cancelled', n=len(past)))}</summary><table>{head}"
-                 f"{''.join(lesson_row(l) for l in past)}</table></details>") if past else ""
-    cards = stat_cards([
+    upcoming_html = ui.table(lesson_heads, [lesson_row(l) for l in upcoming], T("no_upcoming"))
+    past_html = ui.history(T("past_cancelled", n=len(past)), ui.table(lesson_heads, [lesson_row(l) for l in past])) if past else ""
+    cards = ui.kpis([
         (len(upcoming), T("stat_upcoming")),
         (sum(1 for l in upcoming if l.status == "confirmed"), T("stat_confirmed")),
         (sum(1 for l in upcoming if l.status == "scheduled"), T("stat_waiting")),
@@ -327,72 +216,62 @@ def instructor_page(instructor_id: int, request: Request, user: str = Depends(re
         (sum(1 for st in students if st.active), T("stat_students")),
     ])
 
-    waitlist_rows = "".join(
-        f"<tr><td>{esc(name_of.get(w.student_id, '?'))}</td>"
-        f"<td>{esc(T('waiting') if not w.offered else T('offered_slot'))}</td>"
-        f"<td>{_button(f'/admin/waitlist/{w.id}/remove', esc(T('remove')))}</td></tr>"
-        for w in waitlist
-    ) or f"<tr><td colspan='3'>{esc(T('waitlist_empty'))}</td></tr>"
-
     active_students = [st for st in students if st.active]
     student_options = "".join(f"<option value='{st.id}'>{esc(st.name)}</option>" for st in active_students)
     no_students = f"<option disabled>{esc(T('add_student_first'))}</option>"
+    pick = student_options or no_students
 
-    return _page(f"{instructor.name} — DriveBot", f"""
-    <p class="top-link"><a href="/admin">{esc(T('back_instructors'))}</a></p>
-    <h1>{esc(instructor.name)}</h1>
-    <p style="color:var(--muted)" dir="ltr">{esc(instructor.phone)}</p>
-    <div class="card">
-      <strong>{esc(T('private_page'))}</strong>
-      <p>{esc(T('private_hint'))}</p>
-      <input readonly value="{esc(portal_link)}" onclick="this.select()" dir="ltr" style="width:100%">
-      {_button(f'/admin/instructor/{instructor_id}/reset-link', esc(T('reset_link')))}
-    </div>
+    lesson_form = ui.form(
+        f"/admin/instructor/{instructor_id}/lessons",
+        ui.select_field(T("student"), "student_id", pick)
+        + ui.field(T("date_time"), "when", type="datetime-local")
+        + ui.field(T("location_opt"), "location", placeholder="Via Roma 25, Cassino", required=False)
+        + ui.select_field(T("reminder_to"), "reminder",
+                          f'<option value="auto">{esc(T("rem_auto"))}</option><option value="now">{esc(T("rem_now"))}</option>'
+                          f'<option value="2min">{esc(T("rem_2min"))}</option>'),
+        T("schedule_lesson"))
 
-    <h2>{esc(T('students'))}</h2>
-    <table><tr><th>{esc(T('name'))}</th><th>{esc(T('phone'))}</th><th>{esc(T('language'))}</th><th>{esc(T('status'))}</th><th></th></tr>{student_rows}</table>
-    <div class="card">
-      <strong>{esc(T('add_student'))}</strong>
-      <form method="post" action="/admin/instructor/{instructor_id}/students">
-        <label>{esc(T('name'))}</label><input name="name" required>
-        <label>{esc(T('wa_phone_cc'))}</label><input name="phone" placeholder="+39..." dir="ltr" required>
-        <label>{esc(T('message_language'))}</label>
-        <select name="language"><option value="it">{esc(T('lang_it'))}</option><option value="en">{esc(T('lang_en'))}</option></select>
-        <button type="submit">{esc(T('add_student'))}</button>
-      </form>
-    </div>
+    # ---- students
+    stu_heads = [T("name"), T("phone"), T("language"), T("status")]
+    student_rows = [
+        ui.tr(stu_heads, [esc(st.name), f"<span class='mono' dir='ltr'>{esc(st.phone)}</span>", esc(st.language.upper()),
+                          ui.badge("active" if st.active else "inactive")],
+              actions=ui.button_form(f"/admin/student/{st.id}/deactivate", T("deactivate")) if st.active else "")
+        for st in students
+    ]
+    student_form = ui.form(
+        f"/admin/instructor/{instructor_id}/students",
+        ui.field(T("name"), "name") + ui.field(T("wa_phone_cc"), "phone", placeholder="+39...", ltr=True)
+        + ui.select_field(T("message_language"), "language",
+                          f'<option value="it">{esc(T("lang_it"))}</option><option value="en">{esc(T("lang_en"))}</option>'),
+        T("add_student"))
 
-    <h2>{esc(T('lessons'))}</h2>
-    {cards}{upcoming_html}{past_html}
-    <div class="card">
-      <strong>{esc(T('schedule_lesson'))}</strong>
-      <form method="post" action="/admin/instructor/{instructor_id}/lessons">
-        <label>{esc(T('student'))}</label>
-        <select name="student_id" required>{student_options or no_students}</select>
-        <label>{esc(T('date_time'))}</label>
-        <input type="datetime-local" name="when" required>
-        <label>{esc(T('location_opt'))}</label>
-        <input name="location" placeholder="Via Roma 25, Cassino">
-        <label>{esc(T('reminder_to'))}</label>
-        <select name="reminder">
-          <option value="auto">{esc(T('rem_auto'))}</option>
-          <option value="now">{esc(T('rem_now'))}</option>
-          <option value="2min">{esc(T('rem_2min'))}</option>
-        </select>
-        <button type="submit">{esc(T('schedule_lesson'))}</button>
-      </form>
-    </div>
+    # ---- waitlist
+    wl_heads = [T("student"), T("status")]
+    wl_rows = [
+        ui.tr(wl_heads, [esc(name_of.get(w.student_id, "?")),
+                         f"<span class='badge {'info' if w.offered else ''}'>{esc(T('offered_slot') if w.offered else T('waiting'))}</span>"],
+              actions=ui.button_form(f"/admin/waitlist/{w.id}/remove", T("remove")))
+        for w in waitlist
+    ]
+    wl_form = ui.form(f"/admin/instructor/{instructor_id}/waitlist", ui.select_field(T("student"), "student_id", pick),
+                      T("add_to_waitlist"))
 
-    <h2>{esc(T('waitlist'))}</h2>
-    <table><tr><th>{esc(T('student'))}</th><th>{esc(T('status'))}</th><th></th></tr>{waitlist_rows}</table>
-    <div class="card">
-      <strong>{esc(T('add_to_waitlist'))}</strong>
-      <form method="post" action="/admin/instructor/{instructor_id}/waitlist">
-        <label>{esc(T('student'))}</label>
-        <select name="student_id" required>{student_options or no_students}</select>
-        <button type="submit">{esc(T('add_to_waitlist'))}</button>
-      </form>
-    </div>""")
+    link_card = (f'<div class="card reveal" style="--i:1"><div class="label-strong">{esc(T("private_page"))}</div>'
+                 f'<p class="hint">{esc(T("private_hint"))}</p>'
+                 + ui.linkbar(portal_link, T("copy"), T("copied"),
+                              extra_html=ui.button_form(f"/admin/instructor/{instructor_id}/reset-link", T("reset_link"), small=False))
+                 + "</div>")
+
+    body = (ui.header(esc(instructor.name), crumb_href="/admin", crumb_label=T("back_instructors"),
+                      extra_html=f"<span class='pill mono' dir='ltr'>{esc(instructor.phone)}</span>")
+            + link_card + cards
+            + ui.section(T("lessons"), upcoming_html + past_html + ui.panel(T("schedule_lesson"), lesson_form), count=len(upcoming), i=3)
+            + ui.section(T("students"), ui.table(stu_heads, student_rows, T("no_students")) + ui.panel(T("add_student"), student_form),
+                         count=len(active_students), i=4)
+            + ui.section(T("waitlist"), ui.table(wl_heads, wl_rows, T("waitlist_empty")) + ui.panel(T("add_to_waitlist"), wl_form),
+                         count=len(waitlist), i=5))
+    return ui.page(f"{instructor.name} — DriveBot", body)
 
 
 def _require_instructor(s, instructor_id: int) -> Instructor:

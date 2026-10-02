@@ -18,6 +18,10 @@ current_path: ContextVar[str] = ContextVar("path", default="/")
 _T = {
  "language": ("Language", "Lingua", "Langue", "Idioma", "اللغة"),
  "theme": ("Light / dark mode", "Tema chiaro / scuro", "Mode clair / sombre", "Modo claro / oscuro", "الوضع الفاتح / الداكن"),
+ "copy": ("Copy", "Copia", "Copier", "Copiar", "نسخ"),
+ "copied": ("Copied", "Copiato", "Copié", "Copiado", "تم النسخ"),
+ "confirm": ("Are you sure?", "Sei sicuro?", "Êtes-vous sûr ?", "¿Estás seguro?", "هل أنت متأكد؟"),
+ "not_set": ("not set", "non impostato", "non défini", "no configurado", "غير مُعيَّن"),
  "back": ("← Back", "← Indietro", "← Retour", "← Volver", "→ رجوع"),
  "back_instructors": ("← All instructors", "← Tutti gli istruttori", "← Tous les moniteurs", "← Todos los instructores", "→ كل المدربين"),
  "admin_title": ("DriveBot Admin", "Admin DriveBot", "Admin DriveBot", "Admin DriveBot", "إدارة DriveBot"),
